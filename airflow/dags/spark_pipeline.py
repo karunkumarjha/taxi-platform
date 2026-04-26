@@ -68,57 +68,55 @@ DEFAULT_ARGS = {
 }
 
 
-with (
-    DAG(
-        dag_id="spark_pipeline",
-        description=(
-            "Historical Spark backfill — manual-trigger only. "
-            "Set year (and optional month) Param; mapped tasks fan out to "
-            "process each month. Output: s3://.../staged-marts/."
+with DAG(
+    dag_id="spark_pipeline",
+    description=(
+        "Historical Spark backfill — manual-trigger only. "
+        "Set year (and optional month) Param; mapped tasks fan out to "
+        "process each month. Output: s3://.../staged-marts/."
+    ),
+    start_date=datetime(2009, 1, 1),
+    schedule=None,  # manual-trigger only — Spark is historical-only
+    catchup=False,
+    max_active_runs=1,  # multi-year via N triggers serialise here
+    default_args=DEFAULT_ARGS,
+    tags=["spark", "emr", "taxi", "historical"],
+    params={
+        "year": Param(
+            default=2023,
+            type="integer",
+            minimum=2009,
+            maximum=2030,
+            title="Year to process",
+            description=(
+                "All 12 months of this year fan out into mapped task "
+                "instances. Override `month` to process a single month "
+                "instead."
+            ),
         ),
-        start_date=datetime(2009, 1, 1),
-        schedule=None,  # manual-trigger only — Spark is historical-only
-        catchup=False,
-        max_active_runs=1,  # multi-year via N triggers serialise here
-        default_args=DEFAULT_ARGS,
-        tags=["spark", "emr", "taxi", "historical"],
-        params={
-            "year": Param(
-                default=2023,
-                type="integer",
-                minimum=2009,
-                maximum=2030,
-                title="Year to process",
-                description=(
-                    "All 12 months of this year fan out into mapped task "
-                    "instances. Override `month` to process a single month "
-                    "instead."
-                ),
+        "month": Param(
+            default=0,
+            type="integer",
+            minimum=0,
+            maximum=12,
+            title="Month (0 = all 12 months, 1–12 = single month)",
+            description=(
+                "Leave at 0 for a whole-year run (12 mapped tasks). Set "
+                "1–12 to process just that month (1 mapped task)."
             ),
-            "month": Param(
-                default=0,
-                type="integer",
-                minimum=0,
-                maximum=12,
-                title="Month (0 = all 12 months, 1–12 = single month)",
-                description=(
-                    "Leave at 0 for a whole-year run (12 mapped tasks). Set "
-                    "1–12 to process just that month (1 mapped task)."
-                ),
+        ),
+        "force": Param(
+            default=False,
+            type="boolean",
+            title="Force reprocess",
+            description=(
+                "If true, reprocess each month even when "
+                "staged-marts/fct_trips/{tag}/ already exists. Useful "
+                "for fixing a known-bad month."
             ),
-            "force": Param(
-                default=False,
-                type="boolean",
-                title="Force reprocess",
-                description=(
-                    "If true, reprocess each month even when "
-                    "staged-marts/fct_trips/{tag}/ already exists. Useful "
-                    "for fixing a known-bad month."
-                ),
-            ),
-        },
-    ) as dag
-):
+        ),
+    },
+) as dag:
 
     @task(task_id="enumerate_months")
     def enumerate_months(**context) -> list[dict]:

@@ -34,9 +34,13 @@ repos:
 
   # ---- Python: ruff lint + format -----------------------------------------
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.7.4
+    # Pinned to match the ruff version that uv installs in CI — keeps
+    # local pre-commit catching the same lint/format issues GitHub
+    # Actions does. Bump this rev *and* `ruff>=` in pyproject.toml's
+    # dev deps together when updating.
+    rev: v0.15.11
     hooks:
-      - id: ruff
+      - id: ruff-check
         args: [--fix]
         files: ^(ingestion|airflow/dags|scripts|spark)/
       - id: ruff-format

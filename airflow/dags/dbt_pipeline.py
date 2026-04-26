@@ -112,38 +112,36 @@ DBT_ENV = {
 }
 
 
-with (
-    DAG(
-        dag_id="dbt_pipeline",
-        description=(
-            "TLC raw → S3 → Snowflake → dbt (self-healing incremental) → swap marts. "
-            "One DAG run per month. Backfill: `make dbt-backfill START=YYYY-MM END=YYYY-MM`."
-        ),
-        start_date=datetime(2009, 1, 1),  # earliest TLC year — enables backfill all the way back
-        schedule="@monthly",
-        catchup=False,  # don't auto-fire history; backfill is explicit
-        max_active_runs=1,  # sequential — keeps live + backfill ordered
-        default_args=DEFAULT_ARGS,
-        tags=["dbt", "snowflake", "taxi"],
-        params={
-            "lag_months": Param(
-                default=2,
-                type="integer",
-                minimum=0,
-                maximum=12,
-                title="TLC publishing lag (months) — explicit override",
-                description=(
-                    "Subtracted from logical_date to find the month of data to "
-                    "ingest. Auto-defaults: 2 for scheduled/manual runs (TLC's "
-                    "publishing lag), 0 for backfill runs (start/end ARE the "
-                    "data months). Override here only if you need to deviate — "
-                    "the form-default value of 2 is ignored unless you also "
-                    "pass it explicitly via dag_run.conf."
-                ),
+with DAG(
+    dag_id="dbt_pipeline",
+    description=(
+        "TLC raw → S3 → Snowflake → dbt (self-healing incremental) → swap marts. "
+        "One DAG run per month. Backfill: `make dbt-backfill START=YYYY-MM END=YYYY-MM`."
+    ),
+    start_date=datetime(2009, 1, 1),  # earliest TLC year — enables backfill all the way back
+    schedule="@monthly",
+    catchup=False,  # don't auto-fire history; backfill is explicit
+    max_active_runs=1,  # sequential — keeps live + backfill ordered
+    default_args=DEFAULT_ARGS,
+    tags=["dbt", "snowflake", "taxi"],
+    params={
+        "lag_months": Param(
+            default=2,
+            type="integer",
+            minimum=0,
+            maximum=12,
+            title="TLC publishing lag (months) — explicit override",
+            description=(
+                "Subtracted from logical_date to find the month of data to "
+                "ingest. Auto-defaults: 2 for scheduled/manual runs (TLC's "
+                "publishing lag), 0 for backfill runs (start/end ARE the "
+                "data months). Override here only if you need to deviate — "
+                "the form-default value of 2 is ignored unless you also "
+                "pass it explicitly via dag_run.conf."
             ),
-        },
-    ) as dag
-):
+        ),
+    },
+) as dag:
 
     @task(task_id="compute_target_month")
     def compute_target_month(**context) -> dict:
@@ -218,6 +216,7 @@ with (
         """COPY INTO RAW.YELLOW_TRIPDATA scoped to one file (target month).
         Snowflake's COPY history makes re-runs no-ops. As LOADER role."""
         from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
+
         from ingestion.load_snowflake import (
             _cfg_from_env,
             connect,
