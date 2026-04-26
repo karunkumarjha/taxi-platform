@@ -10,8 +10,22 @@ historical Spark backfill — the dbt pipeline is the only writer to
 Snowflake; Spark stages historical facts to S3 and dbt picks them up via
 COPY.
 
+## Video walkthroughs
+
+Watch these first — they cover the architecture and a live end-to-end
+run. The README below has the same content in text form for reference.
+
+- **[Taxi Platform — architecture and project structure](https://www.loom.com/share/7a0ba2d0f1f548d8b80a2ecff2e53dae)**
+  — repo tour and the architectural decisions worth calling out (predicted
+  IAM ARN for single-apply Terraform, self-healing dbt via count-divergence,
+  natural-key dedup, clone-before-build, Spark↔S3↔dbt unification).
+- **[End-to-end pipeline setup and run](https://www.loom.com/share/8d0005513f8c4bfb9d5b0486bc1b3d06)**
+  — full demo from a fresh clone through `./scripts/bootstrap.sh` to the
+  Airflow DAGs running and data landing in Snowflake.
+
 ## Table of contents
 
+- [Video walkthroughs](#video-walkthroughs)
 - [Architecture](#architecture)
   - [Architecture decisions worth calling out](#architecture-decisions-worth-calling-out)
 - [Prerequisites](#prerequisites)
