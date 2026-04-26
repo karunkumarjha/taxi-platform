@@ -31,6 +31,7 @@ COPY.
 - [How the platform answers the four business questions](#how-the-platform-answers-the-four-business-questions)
 - [Repo layout](#repo-layout)
 - [AI tools](#ai-tools)
+- [Trade-offs and shortcuts](#trade-offs-and-shortcuts)
 
 ## Architecture
 
@@ -347,3 +348,24 @@ cost: ~1.5 working days of active iteration vs ~3-4 days
 unassisted. The multiplier wasn't 5×; it was closer to 3-4× — but
 quality is higher because every architectural choice was deliberately
 surfaced.
+
+## Trade-offs and shortcuts
+
+Things we deliberately deferred or accepted in scope. Honest list — these
+are the decisions a reviewer should know were *chosen*, not missed.
+
+| Trade-off | Why we made it | Cost |
+|---|---|---|
+| **Snowflake trial (30-day, $400 credits)** | Free; sufficient for the project. | Reviewer needs the trial or their own account. Setup ~5 min via `./scripts/bootstrap.sh`. |
+| **Astro CLI (Docker required)** for local Airflow | Standard, reviewer-reproducible. | Reviewer needs Docker Desktop. Without Docker, ingestion + dbt still run via `make ingest` / `make dbt` — only Airflow is gated. |
+| **No visualisation / BI layer** | This is a data-engineering platform — the marts are the API. | Any external BI tool (Tableau, Looker, Superset) plugs into MARTS as the `ANALYST` role. The 4 SQL queries in `queries/` demonstrate the answers. |
+| **Spark/dbt validity rules duplicated, not shared** | dbt SQL ↔ PySpark are different runtimes; no clean shared-code path. | 32 PySpark unit tests + natural-key dedup keep the two engines correct in isolation; drift would surface in CI. The 12 rules are short enough that maintaining two copies is acceptable. |
+| **`FCT_TRIPS` materialised as table, not view** | Faster downstream queries, time-travel, clustering, aligned with incremental delete+insert. | ~$0.06/month storage on 2023 (negligible). |
+| **Three Snowflake roles, not more granular** | Aligned with workload boundaries (LOADER writes RAW, DBT owns marts, ANALYST reads). | A real BI deployment might want a separate read-only role per consuming team — easy to add later as additional grants. |
+| **EMR Serverless, not Glue or full EMR** | Zero idle cost; per-job IAM; same `spark-submit` semantics. | Cold start ~30s on first job after idle. Acceptable for monthly cadence + ad-hoc backfills. |
+| **TLC re-published month detection is manual** | Count-divergence rebuilds when fct_count changes; doesn't catch silent re-publishes that keep the same row count. | Operator runs `dbt build --full-refresh` (or deletes the affected aggregate slice) on the rare TLC correction. Documented in `make status` runbook. |
+| **`dbt-spark` adapter not used** | Would let one dbt project run on either Spark or Snowflake, removing the duplicate validity-rule code. ~1 day to set up cleanly. | Deferred — current parity is good enough at this scale; revisit at 1.5B-row scale. |
+| **No production Airflow deployment story** | Adds ~3 hours of MWAA / Astronomer Cloud Terraform module work; doesn't change the rubric. | DAG code is portable to any of those — the local Astro environment is functionally identical. |
+| **Streams + tasks not used for `AGG_ZONE_SUPPLY_GAPS`** | dbt's `incremental` is sufficient at 38M-row scale. | At 1.5B-row historical scale, switching to Snowflake-native CDC would be the next optimization. |
+| **Single-region AWS + Snowflake** | Simpler IAM, simpler cost story. | No cross-region failover. Trivial to extend if needed. |
+| **Spark `_$folder$` markers from EMRFS** | Suppressing them at source requires arcane Hadoop config. | Defensively filtered out by the COPY's `PATTERN = '.*\.parquet'`. Cosmetic noise in S3 listings only. |
