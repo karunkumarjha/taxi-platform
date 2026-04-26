@@ -44,7 +44,10 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "1.6.0"
+          # 1.10+ ships with the refreshed HashiCorp GPG signing key;
+          # older versions fail provider install with "openpgp: key expired"
+          # after HashiCorp's 2025 signing-key rotation.
+          terraform_version: "1.10.5"
           terraform_wrapper: false
 
       - name: Install Python deps

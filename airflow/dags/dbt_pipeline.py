@@ -1,11 +1,16 @@
 """
-dbt_pipeline — schedule-driven, self-healing incremental dbt build.
+dbt_pipeline — dual-triggered, self-healing incremental dbt build.
 
-Every DAG run does the same thing regardless of whether it's a live monthly
-fire, a backfill, or just an idle re-run: ingest the target month's TLC
-parquet, COPY any Spark-staged historical batches into MARTS_BUILD, run dbt's
-self-detecting incremental build, swap. There are no run modes, no required
-parameters, no per-month fan-outs.
+Two trigger sources:
+  • @monthly cron — live fire; ingests the target month's TLC parquet and
+    runs the dbt build.
+  • Airflow Dataset (SPARK_STAGE_DATASET) — fires whenever spark_pipeline
+    completes; skips live TLC ingest (Spark already produced the data) and
+    runs the dbt build, which COPYs the freshly-staged parquet from S3 into
+    MARTS_BUILD via load_spark_staged_into_marts_build.
+
+The dbt build itself is identical across both trigger types — count-divergence
+detection picks up whatever's new in RAW + MARTS_BUILD without per-month vars.
 
     logical_date = YYYY-MM-01  →  ingest data for (logical_date - lag_months)
     @monthly schedule + max_active_runs=1 → sequential live + backfill
@@ -66,12 +71,20 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from airflow.datasets import Dataset
 from airflow.decorators import task
+from airflow.exceptions import AirflowSkipException
 from airflow.models import DAG, Variable
 from airflow.models.param import Param
 from airflow.operators.bash import BashOperator
 from airflow.operators.empty import EmptyOperator
+from airflow.timetables.datasets import DatasetOrTimeSchedule
+from airflow.timetables.trigger import CronTriggerTimetable
 from airflow.utils.task_group import TaskGroup
+
+# Must match the URI that spark_pipeline declares as outlet. Producing this
+# dataset (spark_pipeline → notify_success) triggers a dbt_pipeline run.
+SPARK_STAGE_DATASET = Dataset("spark+s3://staged-marts/fct_trips")
 
 log = logging.getLogger(__name__)
 
@@ -119,7 +132,16 @@ with DAG(
         "One DAG run per month. Backfill: `make dbt-backfill START=YYYY-MM END=YYYY-MM`."
     ),
     start_date=datetime(2009, 1, 1),  # earliest TLC year — enables backfill all the way back
-    schedule="@monthly",
+    # Two trigger sources, OR-ed:
+    #   1. @monthly cron — live monthly fire (ingest TLC + run dbt build).
+    #   2. SPARK_STAGE_DATASET — fires whenever spark_pipeline completes.
+    # Dataset-triggered runs skip ingest_one_month / load_one_month_to_snowflake
+    # (Spark already produced the data); load_spark_staged_into_marts_build
+    # COPYs the new staged parquet into MARTS_BUILD as part of the dbt build.
+    schedule=DatasetOrTimeSchedule(
+        timetable=CronTriggerTimetable("@monthly", timezone="UTC"),
+        datasets=[SPARK_STAGE_DATASET],
+    ),
     catchup=False,  # don't auto-fire history; backfill is explicit
     max_active_runs=1,  # sequential — keeps live + backfill ordered
     default_args=DEFAULT_ARGS,
@@ -198,10 +220,20 @@ with DAG(
         retry_delay=timedelta(hours=12),
         retry_exponential_backoff=False,
     )
-    def ingest_one_month(target: dict) -> str:
+    def ingest_one_month(target: dict, **context) -> str:
         """Stream this month's TLC parquet into S3 raw/. Idempotent — HEAD
         check first, only uploads if missing. Fails (and retries) on 404
-        when TLC hasn't published yet."""
+        when TLC hasn't published yet.
+
+        Skipped on dataset-triggered runs: spark_pipeline already wrote the
+        historical data to S3 staged-marts/, and dbt's load_spark_staged
+        macro will pull it into MARTS_BUILD downstream. No live TLC needed.
+        """
+        if context["dag_run"].run_type == "dataset_triggered":
+            raise AirflowSkipException(
+                "dataset-triggered run — Spark stage covers the data; skipping live TLC ingest."
+            )
+
         from ingestion.ingest_tlc import Month, ingest_missing
 
         bucket = Variable.get("s3_bucket")
@@ -212,9 +244,18 @@ with DAG(
         return month.tag
 
     @task(task_id="load_one_month_to_snowflake", retries=1)
-    def load_one_month_to_snowflake(target: dict) -> str:
+    def load_one_month_to_snowflake(target: dict, **context) -> str:
         """COPY INTO RAW.YELLOW_TRIPDATA scoped to one file (target month).
-        Snowflake's COPY history makes re-runs no-ops. As LOADER role."""
+        Snowflake's COPY history makes re-runs no-ops. As LOADER role.
+
+        Skipped on dataset-triggered runs — see ingest_one_month docstring.
+        """
+        if context["dag_run"].run_type == "dataset_triggered":
+            raise AirflowSkipException(
+                "dataset-triggered run — no live TLC to load; "
+                "Spark output is COPY'd via load_spark_staged_into_marts_build."
+            )
+
         from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 
         from ingestion.load_snowflake import (
@@ -273,12 +314,16 @@ with DAG(
         )
 
     with TaskGroup(group_id="dbt_build") as dbt_build:
+        # trigger_rule="none_failed" — must run on dataset-triggered runs
+        # too, where ingest_one_month / load_one_month_to_snowflake skipped.
+        # Default all_success would propagate the skip into the dbt build.
         dbt_deps = BashOperator(
             task_id="dbt_deps",
             bash_command=f"dbt deps --profiles-dir {DBT_PROFILES_DIR}",
             env=DBT_ENV,
             append_env=True,
             cwd=str(DBT_PROJECT_DIR),
+            trigger_rule="none_failed",
         )
         # Source freshness — emits warnings (not errors) on stale RAW data.
         # Configured in dbt/models/staging/sources.yml. Production-grade signal

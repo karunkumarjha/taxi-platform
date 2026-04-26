@@ -48,10 +48,16 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from airflow.datasets import Dataset
 from airflow.decorators import task
 from airflow.models import DAG, Variable
 from airflow.models.param import Param
 from airflow.operators.empty import EmptyOperator
+
+# Logical dataset identifier shared with dbt_pipeline. URI is arbitrary —
+# Airflow matches producer outlets and consumer schedules by exact string.
+# Updated on successful spark_pipeline completion → triggers dbt_pipeline.
+SPARK_STAGE_DATASET = Dataset("spark+s3://staged-marts/fct_trips")
 
 log = logging.getLogger(__name__)
 
@@ -208,7 +214,14 @@ with DAG(
             _sys.exit(rc)
         return f"s3://{bucket}/staged-marts/fct_trips/{tag}/"
 
-    notify_success = EmptyOperator(task_id="notify_success")
+    # outlets=[SPARK_STAGE_DATASET] fires a dataset event when this task
+    # succeeds — Airflow scheduler then triggers dbt_pipeline (which has the
+    # same dataset declared in its schedule). One event per spark_pipeline
+    # run, after ALL mapped months have completed.
+    notify_success = EmptyOperator(
+        task_id="notify_success",
+        outlets=[SPARK_STAGE_DATASET],
+    )
 
     # ---- Wiring ------------------------------------------------------------
 
