@@ -318,8 +318,8 @@ to Snowflake directly. The S3 handoff is the architectural decoupling.
 |---|---|---|---|
 | Q1 | Zone revenue + monthly rank shift | `MARTS.AGG_ZONE_REVENUE_MONTHLY` | `queries/01_zone_revenue.sql` |
 | Q2 | Demand timing (hour × DOW × month) | `MARTS.AGG_HOURLY_DEMAND` | `queries/02_hourly_demand.sql` |
-| Q3 | Supply gaps per zone per day | `MARTS.AGG_ZONE_SUPPLY_GAPS` | (computed via the mart) |
-| Q4 | Tip behaviour by distance × payment × zone | `MARTS.AGG_ZONE_TIP_BEHAVIOUR` | `queries/03_tip_behaviour.sql` |
+| Q3 | Supply gaps per zone per day | `MARTS.AGG_ZONE_SUPPLY_GAPS` | `queries/03_supply_gaps.sql` |
+| Q4 | Tip behaviour by distance × payment × zone | `MARTS.AGG_ZONE_TIP_BEHAVIOUR` | `queries/04_tip_behaviour.sql` |
 
 Any external BI tool plugs into `MARTS` as the `ANALYST` role.
 
@@ -331,7 +331,7 @@ ingestion/     TLC → S3 streaming + COPY INTO RAW
 dbt/           three-layer self-healing incremental project (~7 models, 60+ tests)
 spark/         EMR Serverless historical staging + 32 PySpark unit tests
 airflow/       Astro project — dbt_pipeline + spark_pipeline DAGs
-queries/       SQL queries answering Q1, Q2, Q4
+queries/       SQL queries answering Q1–Q4 (one file per business question)
 scripts/       with_role.sh credential wrapper, dbt_parse_hook.sh
 .github/       CI workflow
 ```
