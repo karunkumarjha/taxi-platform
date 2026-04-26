@@ -1,0 +1,72 @@
+version: 2
+
+models:
+  - name: stg_yellow_trips
+    description: >
+      Cast + renamed + flagged staging view over raw.yellow_tripdata. `is_valid`
+      partitions rows into the "enrichable" set (int_trips_enriched) and the
+      "quarantine" set (int_trips_quarantined). No rows are ever dropped.
+    columns:
+      - name: trip_sk
+        description: "Synthetic surrogate key (md5 of natural columns)."
+        tests:
+          - not_null
+      - name: pickup_ts
+        tests:
+          - not_null:
+              config:
+                severity: warn  # null_timestamp is captured as invalid_reason
+      - name: payment_type
+        description: "1=credit, 2=cash, 3=no charge, 4=dispute, 5=unknown, 6=voided."
+        tests:
+          - accepted_values:
+              values: [1, 2, 3, 4, 5, 6]
+              config:
+                severity: warn
+      - name: trip_distance
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+              max_value: 200
+              row_condition: "is_valid"  # only enforce the range on rows that passed our validity rules
+              strictly: false
+      - name: fare_amount
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+              max_value: 1000              # matches staging excessive_fare_or_total rule
+              row_condition: "is_valid"
+              strictly: false
+      - name: tip_amount
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+              max_value: 1000
+              row_condition: "is_valid"
+              strictly: false
+      - name: pu_location_id
+        tests:
+          - relationships:
+              to: ref('dim_zones')
+              field: location_id
+              config:
+                severity: warn
+      - name: do_location_id
+        tests:
+          - relationships:
+              to: ref('dim_zones')
+              field: location_id
+              config:
+                severity: warn
+      - name: trip_duration_min
+        description: >
+          Minutes between pickup and dropoff. Custom generic test `trip_duration_sane`
+          enforces a 0–720 minute (12h) ceiling on valid rows; beyond that is
+          almost certainly clock / timezone corruption.
+        tests:
+          - trip_duration_sane:
+              max_minutes: 720
+              row_condition: "is_valid"
+      - name: is_valid
+        description: "Boolean partition key: TRUE rows flow to enriched, FALSE to quarantine."
+

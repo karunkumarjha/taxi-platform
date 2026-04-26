@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+venv/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# dbt
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+dbt/profiles.yml
+dbt/.user.yml
+**/logs/dbt.log
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+*.tfplan
+crash.log
+crash.*.log
+infra/terraform.tfvars
+infra/*.auto.tfvars
+
+# Airflow / Astro
+airflow/.astro/
+airflow/airflow_settings.yaml
+airflow/logs/
+airflow/plugins/__pycache__/
+
+# Tool caches
+.ruff_cache/
+.claude/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp

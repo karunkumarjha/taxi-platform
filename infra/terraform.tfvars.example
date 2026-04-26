@@ -1,0 +1,9 @@
+# Copy to terraform.tfvars and edit. terraform.tfvars is gitignored.
+
+project_name  = "analytics"
+aws_region    = "us-east-1"
+# bucket_suffix = "abc123"   # optional — leave unset for auto-generated 6-char suffix
+
+snowflake_role                   = "ACCOUNTADMIN"
+snowflake_warehouse_size         = "XSMALL"
+snowflake_warehouse_auto_suspend = 60

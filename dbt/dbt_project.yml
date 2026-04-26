@@ -1,0 +1,60 @@
+name: analytics
+version: 1.0.0
+config-version: 2
+
+profile: analytics
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+analysis-paths: ["analyses"]
+snapshot-paths: ["snapshots"]
+
+clean-targets:
+  - target
+  - dbt_packages
+
+# Three logical dbt layers, all materialised in the single MARTS_BUILD
+# Snowflake schema (atomically swapped to MARTS on successful build):
+#   staging       → views   (clean + flag, 1:1 with sources)
+#   intermediate  → tables  (atomic facts: int_trips_enriched, int_trips_quarantined
+#                             — exposed as FCT_TRIPS / FCT_TRIPS_QUARANTINED via +alias)
+#   marts         → tables  (aggregate marts: agg_*)
+#
+# agg_zone_supply_gaps overrides to incremental (see its config block).
+models:
+  analytics:
+    staging:
+      +materialized: view
+      +schema: marts_build
+    intermediate:
+      +materialized: table
+      +schema: marts_build
+    marts:
+      +materialized: table
+      # Blue-green: dbt writes marts into MARTS_BUILD. After all mart tests
+      # pass, the swap_marts macro atomically flips MARTS_BUILD ↔ MARTS so
+      # dashboards (which read MARTS) see the new build instantly. If any
+      # mart test fails, the swap never runs and MARTS keeps the previous
+      # good build. See dbt/macros/swap_marts.sql.
+      +schema: marts_build
+
+seeds:
+  analytics:
+    dim_zones:
+      +schema: marts_build
+      +column_types:
+        location_id: INTEGER
+        borough: STRING
+        zone_name: STRING
+        service_zone: STRING
+
+vars:
+  # Year gate for the staging validity rules and demos.
+  taxi_year: 2023
+  # Row-count sanity bounds for the singular test (±40% month-over-month, per the plan).
+  monthly_rowcount_tolerance: 0.40
+  # Minimum monthly volume before the M-over-M comparison runs. Avoids false
+  # positives from partial-month tails (e.g. a single Feb row in the Jan file).
+  monthly_rowcount_min: 10000

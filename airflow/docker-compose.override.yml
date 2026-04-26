@@ -1,0 +1,27 @@
+# Astro CLI applies this on top of its built-in compose file. We use it to:
+#   1. Mount the repo's source dirs (ingestion/, spark/, dbt/) into the
+#      container so DAG tasks can `from ingestion.x import y` etc.
+#   2. Mount ~/.aws read-only so boto3 in worker tasks finds AWS credentials
+#      via the same profile/SSO setup the host uses.
+# Read-only mounts (`:ro`) keep the container from accidentally mutating
+# host source. dbt/ is mounted writable because dbt writes target/ + logs/.
+
+services:
+  scheduler:
+    volumes:
+      - ../ingestion:/usr/local/airflow/ingestion:ro
+      - ../spark:/usr/local/airflow/spark:ro
+      - ../dbt:/usr/local/airflow/dbt
+      - ${HOME}/.aws:/home/astro/.aws:ro
+  webserver:
+    volumes:
+      - ../ingestion:/usr/local/airflow/ingestion:ro
+      - ../spark:/usr/local/airflow/spark:ro
+      - ../dbt:/usr/local/airflow/dbt
+      - ${HOME}/.aws:/home/astro/.aws:ro
+  triggerer:
+    volumes:
+      - ../ingestion:/usr/local/airflow/ingestion:ro
+      - ../spark:/usr/local/airflow/spark:ro
+      - ../dbt:/usr/local/airflow/dbt
+      - ${HOME}/.aws:/home/astro/.aws:ro

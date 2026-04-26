@@ -1,0 +1,28 @@
+version: 2
+
+seeds:
+  - name: dim_zones
+    description: >
+      TLC zone dimension (LocationID + borough + zone name + service zone)
+      for all 265 location IDs, sourced from
+      https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv.
+
+      Loaded directly into MARTS_BUILD as the canonical DIM_ZONES table —
+      no separate staging or model files; the seed file's headers are
+      already the production column names.
+    columns:
+      - name: location_id
+        description: "Primary key — TLC zone identifier."
+        data_type: NUMBER(38, 0)
+        constraints:
+          - type: not_null
+          - type: primary_key
+        tests:
+          - not_null
+          - unique
+      - name: borough
+        tests:
+          - not_null
+      - name: zone_name
+        tests:
+          - not_null

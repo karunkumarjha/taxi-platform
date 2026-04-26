@@ -1,0 +1,109 @@
+version: 2
+
+# Atomic facts (FCT_TRIPS, FCT_TRIPS_QUARANTINED) are defined in
+# models/intermediate/schema.yml. DIM_ZONES is in seeds/schema.yml.
+# This file describes the AGGREGATE marts that read from those.
+
+models:
+  # ===== Aggregate facts (build on int_trips_enriched a.k.a. FCT_TRIPS) =====
+
+  - name: agg_zone_revenue_monthly
+    description: "Aggregate serving business Q1 (zone revenue + monthly rank shift)."
+    columns:
+      - name: pickup_year
+        tests: [not_null]
+      - name: pickup_month
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 1
+              max_value: 12
+      - name: pu_location_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_zones')
+              field: location_id
+      - name: trip_count
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 1
+      - name: gross_revenue
+        tests:
+          - not_null
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+      - name: revenue_rank_in_month
+        tests:
+          - not_null
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [pickup_year, pickup_month, pu_location_id]
+
+  - name: agg_hourly_demand
+    description: "Aggregate serving business Q2 (hour × DOW demand + avg fare)."
+    columns:
+      - name: pickup_hour
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0
+              max_value: 23
+      - name: pickup_dow
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 1
+              max_value: 7
+      - name: trip_count
+        tests:
+          - dbt_utils.accepted_range:
+              min_value: 1
+      - name: avg_fare
+        tests: [not_null]
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [pickup_year, pickup_month, pickup_dow, pickup_hour]
+
+  - name: agg_zone_supply_gaps
+    description: "Aggregate serving business Q3 (supply gaps by zone per day). Incremental."
+    columns:
+      - name: pickup_date
+        tests: [not_null]
+      - name: pu_location_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_zones')
+              field: location_id
+      - name: longest_gap_min
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+              max_value: 1440   # a single day's upper bound
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [pickup_date, pu_location_id]
+
+  - name: agg_zone_tip_behaviour
+    description: "Aggregate serving business Q4 (tip % by distance bucket × payment type × zone)."
+    columns:
+      - name: pu_location_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_zones')
+              field: location_id
+      - name: distance_bucket
+        tests:
+          - accepted_values:
+              values: ['0-1mi', '1-3mi', '3-5mi', '5-10mi', '10-20mi', '20mi+']
+      - name: payment_type
+        tests:
+          - accepted_values:
+              values: [1, 2, 3, 4, 5, 6]
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns:
+            [pickup_year, pu_location_id, distance_bucket, payment_type]

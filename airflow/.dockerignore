@@ -1,0 +1,7 @@
+.astro/
+.git/
+.venv/
+__pycache__/
+*.pyc
+tests/
+logs/

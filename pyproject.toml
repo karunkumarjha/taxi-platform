@@ -1,0 +1,29 @@
+[project]
+name = "taxi-platform"
+version = "0.1.0"
+description = "NYC TLC Yellow Taxi 2023 — end-to-end data platform (S3 → Snowflake → dbt → Airflow)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "boto3>=1.34",
+    "requests>=2.32",
+    "python-dotenv>=1.0",
+    "snowflake-connector-python>=3.12",
+    "tenacity>=9.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6",
+    "pytest>=8.0",
+    "dbt-core>=1.8,<1.10",
+    "dbt-snowflake>=1.8,<1.10",
+    "pyspark>=3.5,<4.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

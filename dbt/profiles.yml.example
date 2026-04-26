@@ -1,0 +1,24 @@
+# Copy to ~/.dbt/profiles.yml OR keep as dbt/profiles.yml and run with:
+#   dbt --profiles-dir ./dbt <command>
+#
+# All values are env-driven so this file is safe to commit.
+# The same env vars drive ingestion/load_snowflake.py — single source of truth.
+
+analytics:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      password: "{{ env_var('SNOWFLAKE_PASSWORD') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE', 'ACCOUNTADMIN') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE', 'WH_XS') }}"
+      database: "{{ env_var('SNOWFLAKE_DATABASE', 'ANALYTICS') }}"
+      # target.schema is overridden per-model via +schema in dbt_project.yml,
+      # so this default is mostly cosmetic. MARTS_BUILD = where everything dbt
+      # builds lands prior to the SWAP into MARTS.
+      schema: "{{ env_var('SNOWFLAKE_DBT_SCHEMA', 'MARTS_BUILD') }}"
+      threads: 4
+      client_session_keep_alive: false
+      query_tag: "dbt::analytics"

@@ -1,0 +1,73 @@
+version: 2
+
+models:
+  # The intermediate layer materialises atomic facts that aggregate marts
+  # build on. Snowflake table names are kept as FCT_TRIPS / FCT_TRIPS_QUARANTINED
+  # via dbt's +alias config so analysts and dashboards see stable canonical
+  # names in the consumer-facing MARTS schema.
+
+  - name: int_trips_enriched
+    description: >
+      Atomic trip-grain fact (Snowflake table: FCT_TRIPS). One row per VALID
+      taxi trip, zone-joined. Source-of-truth that all aggregate marts (agg_*)
+      build on. Clustered on (pickup_date, pu_location_id) — the two hottest
+      predicates.
+    columns:
+      - name: trip_sk
+        description: "Primary key. Synthetic surrogate (md5 of natural columns)."
+        data_type: VARCHAR
+        constraints:
+          - type: not_null
+          - type: primary_key
+        tests:
+          - not_null
+          - unique
+      - name: pu_location_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_zones')
+              field: location_id
+      - name: do_location_id
+        tests:
+          - not_null
+      - name: pickup_date
+        tests: [not_null]
+      - name: pickup_hour
+        tests:
+          - dbt_utils.accepted_range:
+              min_value: 0
+              max_value: 23
+      - name: pickup_dow
+        tests:
+          - dbt_utils.accepted_range:
+              min_value: 1
+              max_value: 7
+      - name: trip_duration_min
+        tests:
+          - trip_duration_sane:
+              max_minutes: 720
+
+  - name: int_trips_quarantined
+    description: >
+      Audit fact (Snowflake table: FCT_TRIPS_QUARANTINED). Rows that failed
+      staging validity rules, with the reason. Persisted as a table so
+      dirty-record analysis doesn't re-scan RAW.
+    columns:
+      - name: invalid_reason
+        tests:
+          - not_null
+          - accepted_values:
+              values:
+                - null_timestamp
+                - pickup_ge_dropoff
+                - duration_out_of_range
+                - pickup_year_mismatch
+                - non_positive_distance
+                - distance_out_of_range
+                - negative_fare_or_total
+                - excessive_fare_or_total
+                - tip_exceeds_fare_or_total
+                - unknown_payment_type
+                - null_location_id
+                - duplicate_row
