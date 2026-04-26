@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # with_role.sh — run a command with the Snowflake env vars set for one of
-# the four functional roles (loader / dbt / dashboard / analyst).
+# the three functional roles (loader / dbt / analyst), or tf for Terraform.
 #
 # Usage:
 #   ./scripts/with_role.sh <role> <command...>
@@ -20,7 +20,7 @@ set -euo pipefail
 
 if [[ $# -lt 2 ]]; then
     echo "usage: $0 <role> <command...>"
-    echo "  roles: loader | dbt | dashboard | analyst | tf"
+    echo "  roles: loader | dbt | analyst | tf"
     exit 64
 fi
 
@@ -46,11 +46,6 @@ case "$role" in
         export SNOWFLAKE_USER="${SNOWFLAKE_DBT_USER:?missing SNOWFLAKE_DBT_USER}"
         export SNOWFLAKE_PASSWORD="${SNOWFLAKE_DBT_PASSWORD:?missing SNOWFLAKE_DBT_PASSWORD}"
         export SNOWFLAKE_ROLE="${SNOWFLAKE_DBT_ROLE:-DBT}"
-        ;;
-    dashboard)
-        export SNOWFLAKE_USER="${SNOWFLAKE_DASHBOARD_USER:?missing SNOWFLAKE_DASHBOARD_USER}"
-        export SNOWFLAKE_PASSWORD="${SNOWFLAKE_DASHBOARD_PASSWORD:?missing SNOWFLAKE_DASHBOARD_PASSWORD}"
-        export SNOWFLAKE_ROLE="${SNOWFLAKE_DASHBOARD_ROLE:-DASHBOARD}"
         ;;
     analyst)
         export SNOWFLAKE_USER="${SNOWFLAKE_ANALYST_USER:?missing SNOWFLAKE_ANALYST_USER}"
@@ -83,7 +78,7 @@ case "$role" in
         ;;
     *)
         echo "unknown role: $role"
-        echo "valid roles: loader | dbt | dashboard | analyst | tf"
+        echo "valid roles: loader | dbt | analyst | tf"
         exit 64
         ;;
 esac

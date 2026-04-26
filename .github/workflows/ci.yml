@@ -1,0 +1,122 @@
+name: CI
+
+# Pre-commit covers the fast checks (ruff, terraform fmt, dbt parse) on the
+# developer's machine. CI runs the same checks again as a safety net AND adds
+# the slower ones that can't fit in pre-commit:
+#   • terraform validate (needs `terraform init` to download providers)
+#   • Airflow DagBag load (~30s + Airflow install)
+#   • PySpark unit tests (~50s + JVM)
+#
+# Total runtime: ~3-5 minutes per PR with caching.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---- Toolchain --------------------------------------------------
+      - name: Setup uv (with cache)
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Setup Python 3.11
+        run: uv python install 3.11
+
+      - name: Setup Java (for PySpark)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.0"
+          terraform_wrapper: false
+
+      - name: Install Python deps
+        run: uv sync --all-groups
+
+      # ---- Fast checks (mirror pre-commit) ----------------------------
+      - name: Check requirements.txt is up-to-date
+        run: |
+          uv export --no-hashes --no-dev   > /tmp/requirements.txt
+          uv export --no-hashes --only-dev > /tmp/requirements-dev.txt
+          diff /tmp/requirements.txt     requirements.txt
+          diff /tmp/requirements-dev.txt requirements-dev.txt
+
+      - name: Lint — ruff check
+        run: uv run ruff check ingestion airflow/dags scripts spark
+
+      - name: Lint — ruff format
+        run: uv run ruff format --check ingestion airflow/dags scripts spark
+
+      - name: Terraform fmt
+        run: terraform -chdir=infra fmt -check -recursive
+
+      - name: dbt parse (Jinja/SQL syntax)
+        env:
+          SNOWFLAKE_ACCOUNT: fake
+          SNOWFLAKE_USER: fake
+          SNOWFLAKE_PASSWORD: fake
+          SNOWFLAKE_ROLE: DBT
+          SNOWFLAKE_WAREHOUSE: WH_XS
+          SNOWFLAKE_DATABASE: ANALYTICS
+          SNOWFLAKE_DBT_SCHEMA: MARTS_BUILD
+          SNOWFLAKE_RAW_SCHEMA: RAW
+        run: |
+          cp dbt/profiles.yml.example dbt/profiles.yml
+          uv run python -m dbt.cli.main deps  --project-dir dbt --profiles-dir dbt
+          uv run python -m dbt.cli.main parse --project-dir dbt --profiles-dir dbt
+
+      # ---- Slow checks (CI-only) --------------------------------------
+      - name: Terraform validate
+        run: |
+          terraform -chdir=infra init -backend=false -input=false
+          terraform -chdir=infra validate
+
+      - name: Airflow DagBag load test
+        run: |
+          uv run --with 'apache-airflow==3.0.0' \
+                 --with apache-airflow-providers-snowflake \
+                 python -c "
+          import sys; sys.path.insert(0, 'airflow')
+          from airflow.models import DagBag
+          db = DagBag(dag_folder='airflow/dags', include_examples=False)
+          assert not db.import_errors, db.import_errors
+          assert 'dbt_pipeline' in db.dags, 'dbt_pipeline missing'
+          assert 'spark_pipeline' in db.dags, 'spark_pipeline missing'
+          dbt_tasks = {t.task_id for t in db.dags['dbt_pipeline'].tasks}
+          required = {
+              'compute_target_month', 'ingest_one_month', 'load_one_month_to_snowflake',
+              'dbt_build.reset_marts_build_from_marts',
+              'dbt_build.load_spark_staged_into_marts_build',
+              'dbt_build.swap_marts_blue_green', 'notify_success',
+          }
+          missing = required - dbt_tasks
+          assert not missing, f'dbt_pipeline missing tasks: {missing}'
+          print('DagBag OK — DAGs:', list(db.dags.keys()))
+          "
+
+      - name: PySpark unit tests
+        run: uv run python -m pytest spark/tests -v
+
+      # ---- Belt-and-suspenders: re-run pre-commit on the whole tree ---
+      # Catches anything a developer's missing/disabled pre-commit hook
+      # would have caught locally. Should always pass if the individual
+      # CI steps above passed.
+      - name: pre-commit (all files)
+        run: uv run pre-commit run --all-files --show-diff-on-failure

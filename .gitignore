@@ -38,7 +38,6 @@ infra/*.auto.tfvars
 airflow/.astro/
 airflow/airflow_settings.yaml
 airflow/logs/
-airflow/plugins/__pycache__/
 
 # Tool caches
 .ruff_cache/

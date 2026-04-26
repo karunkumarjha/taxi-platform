@@ -51,7 +51,7 @@ resource "aws_iam_role" "emr_exec" {
 }
 
 data "aws_iam_policy_document" "emr_exec_policy" {
-  # Read the raw + scripts prefixes, write analytics + logs.
+  # Read the raw + scripts prefixes, write staged-marts + logs.
   statement {
     effect    = "Allow"
     actions   = ["s3:ListBucket", "s3:GetBucketLocation"]
@@ -78,7 +78,9 @@ data "aws_iam_policy_document" "emr_exec_policy" {
       "s3:ListMultipartUploadParts",
     ]
     resources = [
-      "${aws_s3_bucket.data.arn}/analytics/*",
+      # staged-marts/ — Spark writes FCT_TRIPS / FCT_TRIPS_QUARANTINED parquet
+      # here for the dbt_pipeline DAG to COPY into MARTS_BUILD.
+      "${aws_s3_bucket.data.arn}/staged-marts/*",
       "${aws_s3_bucket.data.arn}/spark-logs/*",
     ]
   }

@@ -1,0 +1,59 @@
+# Pre-commit hooks — sub-5s checks that run before every commit.
+#
+# Install once:
+#   make hooks-install
+#   (or:   uv run pre-commit install)
+#
+# Run manually on all files:
+#   uv run pre-commit run --all-files
+#
+# Skip in an emergency (rare!):
+#   git commit --no-verify
+#
+# Slower checks (Spark unit tests, DagBag load, terraform validate) run in
+# CI only — see .github/workflows/ci.yml. Pre-commit and CI cover overlapping
+# fast checks deliberately: pre-commit gives you fast local feedback;
+# CI is the safety net that catches anything that slipped through.
+
+repos:
+  # ---- Generic hygiene -----------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: '\.parquet$|^dbt/(target|dbt_packages|logs)/|\.tfstate$'
+      - id: end-of-file-fixer
+        exclude: '\.parquet$|^dbt/(target|dbt_packages|logs)/|\.tfstate$|^docs/architecture\.png$'
+      - id: check-yaml
+        exclude: '^airflow/airflow_settings\.yaml$'  # contains placeholder values
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=1000]
+      - id: check-toml
+      - id: check-json
+
+  # ---- Python: ruff lint + format -----------------------------------------
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.7.4
+    hooks:
+      - id: ruff
+        args: [--fix]
+        files: ^(ingestion|airflow/dags|scripts|spark)/
+      - id: ruff-format
+        files: ^(ingestion|airflow/dags|scripts|spark)/
+
+  # ---- Terraform: fmt only (validate needs terraform init → CI only) ------
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.96.1
+    hooks:
+      - id: terraform_fmt
+
+  # ---- dbt parse — Jinja/SQL syntax check across all models + macros ------
+  - repo: local
+    hooks:
+      - id: dbt-parse
+        name: dbt parse (jinja/sql syntax)
+        entry: scripts/dbt_parse_hook.sh
+        language: system
+        files: ^dbt/(models|macros|tests|seeds|dbt_project\.yml|packages\.yml)
+        pass_filenames: false

@@ -222,8 +222,12 @@ def main(argv: list[str] | None = None) -> int:
     uploaded = ingest_missing(months, args.bucket, args.prefix)
 
     elapsed = (datetime.utcnow() - started).total_seconds()
-    log.info("ingest done uploaded=%d skipped=%d elapsed=%.1fs",
-             len(uploaded), len(months) - len(uploaded), elapsed)
+    log.info(
+        "ingest done uploaded=%d skipped=%d elapsed=%.1fs",
+        len(uploaded),
+        len(months) - len(uploaded),
+        elapsed,
+    )
 
     # Emit uploaded keys to stdout, one per line, for downstream tooling (Airflow XCom).
     for key in uploaded:

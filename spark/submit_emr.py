@@ -1,30 +1,21 @@
 """
-Submit one EMR Serverless job per (year, month) of TLC data.
+Submit ONE EMR Serverless job for a single (year, month) of TLC data.
 
-Why one job per month:
-    Spark job grain matches output partition grain (year, month). Failures are
-    isolated to a single month; backfills are a deterministic loop. EMR
-    Serverless's pre-init capacity = 0 means we pay nothing for idle time
-    between submissions.
+The Airflow `spark_pipeline` DAG is the canonical driver — it computes the
+target month from `logical_date` and calls `main(["--year", "2023", "--month", "6"])`
+on its own python path. This module is also usable from the CLI for ad-hoc
+single-month submissions:
 
-Submission modes:
-    Sequential (default) — wait for each job to finish before submitting next.
-                          Safe, deterministic, easy to debug.
-    Parallel             — fire all jobs at once, poll for terminal state.
-                          Faster but bounded by the EMR app's max capacity.
+    python -m spark.submit_emr --year 2023 --month 6
 
-Usage:
-    # Single month
-    python -m spark.submit_emr --year 2023 --month 1
+For multi-month backfill, use `make spark-backfill START=YYYY-MM END=YYYY-MM`,
+which loops `airflow dags backfill spark_pipeline` — each scheduled run
+submits one EMR job. Single-writer-per-month, sequential by `max_active_runs=1`.
 
-    # Whole year (sequential, default)
-    python -m spark.submit_emr --year 2023
-
-    # Whole year (parallel)
-    python -m spark.submit_emr --year 2023 --parallel
-
-    # Multi-year backfill
-    python -m spark.submit_emr --years 2022,2023
+Why this module is intentionally small: the DAG is the right place for
+multi-month orchestration (retries, observability, scheduling). Replicating
+it here as `--years` / `--parallel` flags duplicates surface area without
+adding capability the DAG doesn't already have.
 
 Environment (auto-loaded from .env):
     S3_BUCKET, EMR_APPLICATION_ID, EMR_EXEC_ROLE_ARN, AWS_REGION
@@ -37,12 +28,9 @@ import logging
 import os
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 from pathlib import Path
 
 import boto3
-from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -53,32 +41,13 @@ TERMINAL_STATES = {"SUCCESS", "FAILED", "CANCELLED", "CANCELLING"}
 POLL_SECONDS = 20
 
 
-@dataclass(frozen=True)
-class MonthRun:
-    year: int
-    month: int
-
-    @property
-    def tag(self) -> str:
-        """ISO month tag, e.g. '2023-07'."""
-        return f"{self.year:04d}-{self.month:02d}"
-
-    @property
-    def job_name(self) -> str:
-        """EMR job-run name for this month."""
-        return f"taxi_monthly_{self.tag}"
-
-
 # --------------------------------------------------------------------------- #
-# Artifact upload (one-time per run, shared across all month jobs)            #
+# Artifact upload                                                             #
 # --------------------------------------------------------------------------- #
 
 
 def upload_artifacts(s3, bucket: str, scripts_prefix: str = "spark-scripts/") -> tuple[str, str]:
-    """Upload the PySpark entry point + dim_zones CSV to S3. Returns the URIs.
-
-    These are uploaded ONCE per submit_emr run, then re-used by every month job.
-    """
+    """Upload the PySpark entry point + dim_zones CSV to S3. Returns the URIs."""
     repo_root = Path(__file__).resolve().parent.parent
     script_local = repo_root / "spark" / "process_historical.py"
     zones_local = repo_root / "dbt" / "seeds" / "dim_zones.csv"
@@ -88,7 +57,7 @@ def upload_artifacts(s3, bucket: str, scripts_prefix: str = "spark-scripts/") ->
             raise SystemExit(f"missing artifact: {path}")
 
     script_key = f"{scripts_prefix}{script_local.name}"
-    zones_key  = f"{scripts_prefix}{zones_local.name}"
+    zones_key = f"{scripts_prefix}{zones_local.name}"
 
     log.info("uploading %s → s3://%s/%s", script_local.name, bucket, script_key)
     s3.upload_file(str(script_local), bucket, script_key)
@@ -100,11 +69,11 @@ def upload_artifacts(s3, bucket: str, scripts_prefix: str = "spark-scripts/") ->
 
 
 # --------------------------------------------------------------------------- #
-# Per-month job submission                                                    #
+# Job submission                                                              #
 # --------------------------------------------------------------------------- #
 
 
-def start_one_month(
+def start_job(
     emr,
     *,
     application_id: str,
@@ -112,21 +81,28 @@ def start_one_month(
     script_uri: str,
     zones_uri: str,
     bucket: str,
-    run: MonthRun,
+    year: int,
+    month: int,
 ) -> str:
-    """Submit one month and return the job_run_id (does NOT wait)."""
+    """Submit one (year, month) job and return the job_run_id (does NOT wait)."""
+    tag = f"{year:04d}-{month:02d}"
     entry_args = [
-        "--input",  f"s3://{bucket}/raw/",
-        "--output", f"s3://{bucket}/analytics/daily_zone_aggregates/",
-        "--zones",  zones_uri,
-        "--year",   str(run.year),
-        "--month",  str(run.month),
+        "--input",
+        f"s3://{bucket}/raw/",
+        "--output",
+        f"s3://{bucket}/staged-marts/",
+        "--zones",
+        zones_uri,
+        "--year",
+        str(year),
+        "--month",
+        str(month),
     ]
 
     resp = emr.start_job_run(
         applicationId=application_id,
         executionRoleArn=exec_role_arn,
-        name=run.job_name,
+        name=f"taxi_monthly_{tag}",
         jobDriver={
             "sparkSubmit": {
                 "entryPoint": script_uri,
@@ -134,7 +110,6 @@ def start_one_month(
                 "sparkSubmitParameters": (
                     "--conf spark.sql.adaptive.enabled=true "
                     "--conf spark.sql.adaptive.skewJoin.enabled=true "
-                    "--conf spark.sql.sources.partitionOverwriteMode=dynamic "
                     "--conf spark.executor.cores=4 "
                     "--conf spark.executor.memory=8g "
                     "--conf spark.driver.cores=2 "
@@ -145,7 +120,7 @@ def start_one_month(
         configurationOverrides={
             "monitoringConfiguration": {
                 "s3MonitoringConfiguration": {
-                    "logUri": f"s3://{bucket}/spark-logs/{run.tag}/",
+                    "logUri": f"s3://{bucket}/spark-logs/{tag}/",
                 },
             },
         },
@@ -165,110 +140,21 @@ def wait_for(emr, application_id: str, job_run_id: str, *, label: str = "") -> d
 
 
 # --------------------------------------------------------------------------- #
-# Orchestration                                                               #
+# CLI                                                                         #
 # --------------------------------------------------------------------------- #
 
 
-def parse_runs(args) -> list[MonthRun]:
-    """Build the list of (year, month) runs from CLI args."""
-    runs: list[MonthRun] = []
-
-    if args.years:
-        years = sorted({int(y.strip()) for y in args.years.split(",") if y.strip()})
-        for y in years:
-            runs.extend(MonthRun(y, m) for m in range(1, 13))
-    elif args.month is not None:
-        runs.append(MonthRun(args.year, args.month))
-    else:
-        runs.extend(MonthRun(args.year, m) for m in range(1, 13))
-
-    return runs
-
-
-def submit_sequential(emr, runs: list[MonthRun], **submit_kwargs) -> int:
-    """Submit one at a time, waiting between. Returns 0 if all succeed, 1 otherwise."""
-    application_id = submit_kwargs["application_id"]
-    failures: list[str] = []
-    for run in runs:
-        log.info("=== %s submit ===", run.tag)
-        job_run_id = start_one_month(emr, run=run, **submit_kwargs)
-        final = wait_for(emr, application_id, job_run_id, label=run.tag)
-        if final["state"] != "SUCCESS":
-            log.error("%s FAILED: %s", run.tag, final.get("stateDetails"))
-            failures.append(run.tag)
-        else:
-            log.info("%s ok", run.tag)
-    if failures:
-        log.error("failed months: %s", ", ".join(failures))
-        return 1
-    return 0
-
-
-def submit_parallel(emr, runs: list[MonthRun], **submit_kwargs) -> int:
-    """Submit all jobs immediately, poll each in its own thread.
-
-    The EMR app's max capacity caps actual parallelism; jobs beyond that
-    queue inside the application. With our default 32 vCPU app and 4-core
-    executors, ~6-8 concurrent jobs is a safe target.
-    """
-    application_id = submit_kwargs["application_id"]
-    log.info("submitting %d jobs in parallel", len(runs))
-
-    job_ids: dict[str, str] = {}     # tag -> job_run_id
-    for run in runs:
-        try:
-            jid = start_one_month(emr, run=run, **submit_kwargs)
-            job_ids[run.tag] = jid
-            log.info("submitted %s → %s", run.tag, jid)
-        except ClientError as exc:
-            log.error("submit %s failed: %s", run.tag, exc)
-
-    # Poll each job to completion in its own thread.
-    failures: list[str] = []
-    with ThreadPoolExecutor(max_workers=min(len(job_ids), 16)) as pool:
-        futs = {
-            pool.submit(wait_for, emr, application_id, jid, label=tag): tag
-            for tag, jid in job_ids.items()
-        }
-        for fut in as_completed(futs):
-            tag = futs[fut]
-            final = fut.result()
-            if final["state"] != "SUCCESS":
-                log.error("%s FAILED: %s", tag, final.get("stateDetails"))
-                failures.append(tag)
-
-    if failures:
-        log.error("failed months: %s", ", ".join(sorted(failures)))
-        return 1
-    return 0
-
-
 def main(argv: list[str] | None = None) -> int:
-    """CLI entry: upload artifacts and submit EMR Serverless jobs (sequential or parallel)."""
+    """CLI entry: upload artifacts, submit one EMR Serverless job, wait for terminal."""
     parser = argparse.ArgumentParser(description=__doc__)
 
-    # AWS / EMR config (env-driven)
-    parser.add_argument("--bucket",         default=os.environ.get("S3_BUCKET"))
+    parser.add_argument("--bucket", default=os.environ.get("S3_BUCKET"))
     parser.add_argument("--application-id", default=os.environ.get("EMR_APPLICATION_ID"))
-    parser.add_argument("--exec-role-arn",  default=os.environ.get("EMR_EXEC_ROLE_ARN"))
-    parser.add_argument("--region",         default=os.environ.get("AWS_REGION"))
+    parser.add_argument("--exec-role-arn", default=os.environ.get("EMR_EXEC_ROLE_ARN"))
+    parser.add_argument("--region", default=os.environ.get("AWS_REGION"))
 
-    # What to run — three forms (mutually exclusive in practice):
-    parser.add_argument(
-        "--year", type=int,
-        help="Year to process. With --month, runs that single month; without, runs all 12.",
-    )
-    parser.add_argument(
-        "--month", type=int, choices=range(1, 13), metavar="{1..12}",
-        help="Single-month run. Requires --year.",
-    )
-    parser.add_argument(
-        "--years", type=str,
-        help="Comma-separated years for full-history backfill (e.g. '2020,2021,2022').",
-    )
-
-    parser.add_argument("--parallel", action="store_true",
-                        help="Submit all jobs at once (vs sequential).")
+    parser.add_argument("--year", type=int, required=True)
+    parser.add_argument("--month", type=int, required=True, choices=range(1, 13), metavar="{1..12}")
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -276,40 +162,45 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    # Validation
-    missing = [k for k, v in {
-        "bucket": args.bucket,
-        "application_id": args.application_id,
-        "exec_role_arn": args.exec_role_arn,
-    }.items() if not v]
+    missing = [
+        k
+        for k, v in {
+            "bucket": args.bucket,
+            "application_id": args.application_id,
+            "exec_role_arn": args.exec_role_arn,
+        }.items()
+        if not v
+    ]
     if missing:
         parser.error(f"missing: {', '.join(missing)} (pass via flag or env)")
-    if not args.year and not args.years:
-        parser.error("specify --year [--month] or --years")
-    if args.month is not None and not args.year:
-        parser.error("--month requires --year")
 
-    runs = parse_runs(args)
-    log.info("planning %d run(s): %s", len(runs), [r.tag for r in runs])
+    tag = f"{args.year:04d}-{args.month:02d}"
+    log.info("submitting EMR job for %s", tag)
 
     session_kwargs = {"region_name": args.region} if args.region else {}
     session = boto3.Session(**session_kwargs)
-    s3  = session.client("s3")
+    s3 = session.client("s3")
     emr = session.client("emr-serverless")
 
     script_uri, zones_uri = upload_artifacts(s3, args.bucket)
 
-    submit_kwargs = dict(
+    job_run_id = start_job(
+        emr,
         application_id=args.application_id,
         exec_role_arn=args.exec_role_arn,
         script_uri=script_uri,
         zones_uri=zones_uri,
         bucket=args.bucket,
+        year=args.year,
+        month=args.month,
     )
 
-    if args.parallel:
-        return submit_parallel(emr, runs, **submit_kwargs)
-    return submit_sequential(emr, runs, **submit_kwargs)
+    final = wait_for(emr, args.application_id, job_run_id, label=tag)
+    if final["state"] != "SUCCESS":
+        log.error("%s FAILED: %s", tag, final.get("stateDetails"))
+        return 1
+    log.info("%s ok", tag)
+    return 0
 
 
 if __name__ == "__main__":

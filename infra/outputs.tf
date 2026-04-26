@@ -47,9 +47,9 @@ output "snowflake_external_id" {
 
 # --- Phase 2 outputs ---------------------------------------------------------
 
-output "s3_analytics_uri" {
-  description = "s3:// URI where Spark writes daily aggregations"
-  value       = "s3://${aws_s3_bucket.data.bucket}/analytics/"
+output "s3_staged_marts_uri" {
+  description = "s3:// URI where Spark stages FCT_TRIPS / FCT_TRIPS_QUARANTINED parquet for dbt to COPY"
+  value       = "s3://${aws_s3_bucket.data.bucket}/staged-marts/"
 }
 
 output "s3_spark_scripts_uri" {
@@ -96,17 +96,6 @@ output "snowflake_dbt_password" {
   sensitive = true
 }
 
-output "snowflake_dashboard_user" {
-  value = snowflake_user.dashboard.name
-}
-output "snowflake_dashboard_role" {
-  value = snowflake_account_role.dashboard.name
-}
-output "snowflake_dashboard_password" {
-  value     = random_password.dashboard.result
-  sensitive = true
-}
-
 output "snowflake_analyst_user" {
   value = snowflake_user.analyst.name
 }
@@ -118,14 +107,7 @@ output "snowflake_analyst_password" {
   sensitive = true
 }
 
-# --- Streamlit-in-Snowflake -------------------------------------------------
-
-output "streamlit_app" {
-  description = "Fully-qualified Streamlit app name (open via Snowsight → Streamlit)"
-  value       = "${snowflake_database.analytics.name}.${snowflake_schema.marts.name}.${snowflake_streamlit.analytics_app.name}"
-}
-
-output "streamlit_app_stage" {
-  description = "Stage that hosts the Streamlit source files. PUT new code here."
-  value       = "${snowflake_database.analytics.name}.${snowflake_schema.marts.name}.${snowflake_stage.streamlit_app.name}"
+output "snowflake_spark_stage" {
+  description = "Fully-qualified Spark stage name for COPY INTO MARTS_BUILD.FCT_TRIPS"
+  value       = "${snowflake_database.analytics.name}.${snowflake_schema.raw.name}.${snowflake_stage.s3_spark_stage.name}"
 }

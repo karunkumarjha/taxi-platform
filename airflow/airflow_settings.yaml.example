@@ -1,17 +1,22 @@
-# Local-dev connections + variables for `astro dev start`.
-# Copy to airflow_settings.yaml (gitignored) and fill in real values.
+# Local-dev Airflow connections + variables. Imported by `astro dev start`
+# into a fresh metadata DB.
+#
+# This file is a TEMPLATE — `scripts/bootstrap.sh` substitutes the
+# __PLACEHOLDER__ tokens with values pulled from `terraform output` and
+# writes the result to airflow_settings.yaml (gitignored). Don't edit
+# this file by hand unless you're adjusting the structure.
 
 airflow:
   connections:
     # ---- Snowflake (per-role connections, matches RBAC) ------------------
-    # LOADER — used ONLY by load_raw_to_snowflake. Writes RAW.YELLOW_TRIPDATA.
+    # LOADER — used ONLY by load_one_month_to_snowflake. Writes RAW.YELLOW_TRIPDATA.
     - conn_id: snowflake_loader
       conn_type: snowflake
       conn_login: LOADER
-      conn_password: <from `terraform output -raw snowflake_loader_password`>
+      conn_password: __SNOWFLAKE_LOADER_PASSWORD__
       conn_schema: RAW
       conn_extra:
-        account: ABCD-XY12345
+        account: __SNOWFLAKE_ACCOUNT__
         warehouse: WH_XS
         database: ANALYTICS
         role: LOADER
@@ -20,14 +25,14 @@ airflow:
         file_format: PARQUET_FF
         raw_table: YELLOW_TRIPDATA
 
-    # DBT — used by every dbt task + the swap. Owns STAGING/MARTS/MARTS_BUILD.
+    # DBT — used by every dbt task + the swap. Owns MARTS + MARTS_BUILD.
     - conn_id: snowflake_dbt
       conn_type: snowflake
       conn_login: DBT
-      conn_password: <from `terraform output -raw snowflake_dbt_password`>
+      conn_password: __SNOWFLAKE_DBT_PASSWORD__
       conn_schema: MARTS_BUILD
       conn_extra:
-        account: ABCD-XY12345
+        account: __SNOWFLAKE_ACCOUNT__
         warehouse: WH_XS
         database: ANALYTICS
         role: DBT
@@ -36,29 +41,18 @@ airflow:
     - conn_id: aws_default
       conn_type: aws
       conn_extra:
-        region_name: us-east-1
+        region_name: __AWS_REGION__
 
   variables:
     - variable_name: s3_bucket
-      variable_value: analytics-data-xxxxxx     # from `terraform output s3_bucket`
+      variable_value: __S3_BUCKET__
     - variable_name: s3_raw_prefix
       variable_value: raw/
-    - variable_name: taxi_year
-      variable_value: "2023"             # start year
-    - variable_name: taxi_year_end
-      variable_value: "2023"             # upper-bound year (inclusive). Leave blank for "all years up to today".
-
-    # ---- Spark / EMR Serverless ------------------------------------------
     - variable_name: emr_application_id
-      variable_value: ""                         # from `terraform output emr_application_id`
+      variable_value: __EMR_APPLICATION_ID__
     - variable_name: emr_exec_role_arn
-      variable_value: ""                         # from `terraform output emr_exec_role_arn`
+      variable_value: __EMR_EXEC_ROLE_ARN__
     - variable_name: aws_region
-      variable_value: "us-east-1"
-    # Caps how many EMR jobs the spark_pipeline mapped task can run in
-    # parallel. EMR app's max capacity is 32 vCPU; with 4-core executors
-    # we comfortably fit 6-8. Default 4 leaves headroom.
-    - variable_name: max_concurrent_spark_jobs
-      variable_value: "4"
+      variable_value: __AWS_REGION__
 
   pools: []

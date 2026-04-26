@@ -69,4 +69,3 @@ models:
               row_condition: "is_valid"
       - name: is_valid
         description: "Boolean partition key: TRUE rows flow to enriched, FALSE to quarantine."
-

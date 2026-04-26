@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS {db}.{schema}.{table} (
     total_amount            NUMBER(18, 4),
     congestion_surcharge    NUMBER(18, 4),
     airport_fee             NUMBER(18, 4),
+    cbd_congestion_fee      NUMBER(18, 4),
     -- load metadata
     _source_filename        STRING,
     _loaded_at              TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()
@@ -59,7 +60,7 @@ COPY INTO {db}.{schema}.{table} (
     trip_distance, RatecodeID, store_and_fwd_flag, PULocationID, DOLocationID,
     payment_type, fare_amount, extra, mta_tax, tip_amount, tolls_amount,
     improvement_surcharge, total_amount, congestion_surcharge, airport_fee,
-    _source_filename
+    cbd_congestion_fee, _source_filename
 )
 FROM (
     SELECT
@@ -87,9 +88,15 @@ FROM (
         $1:total_amount::NUMBER(18, 4),
         $1:congestion_surcharge::NUMBER(18, 4),
         $1:airport_fee::NUMBER(18, 4),
+        -- cbd_congestion_fee was added to the TLC schema in 2025 for the
+        -- NYC congestion pricing zone surcharge. Older parquet files don't
+        -- have this field — Snowflake's $1:field returns NULL for missing
+        -- variant keys, so the cast yields NULL automatically. No
+        -- conditional logic needed.
+        $1:cbd_congestion_fee::NUMBER(18, 4),
         METADATA$FILENAME
     FROM @{db}.{schema}.{stage}
-)
+){files_clause}
 FILE_FORMAT = (FORMAT_NAME = '{db}.{schema}.{file_format}')
 ON_ERROR = 'ABORT_STATEMENT'
 PURGE = FALSE
@@ -111,25 +118,41 @@ def connect(cfg: dict) -> snowflake.connector.SnowflakeConnection:
 
 def ensure_table(conn, cfg: dict) -> None:
     """Create RAW.YELLOW_TRIPDATA if it doesn't already exist."""
-    ddl = TARGET_TABLE_DDL.format(
-        db=cfg["database"], schema=cfg["schema"], table=cfg["table"]
-    )
+    ddl = TARGET_TABLE_DDL.format(db=cfg["database"], schema=cfg["schema"], table=cfg["table"])
     with conn.cursor() as cur:
         cur.execute(ddl)
         log.info("ensured table %s.%s.%s", cfg["database"], cfg["schema"], cfg["table"])
 
 
-def copy_from_stage(conn, cfg: dict) -> list[tuple]:
-    """Run COPY INTO from the external stage; returns the per-file result rows."""
+def copy_from_stage(conn, cfg: dict, *, month: str | None = None) -> list[tuple]:
+    """Run COPY INTO from the external stage; returns the per-file result rows.
+
+    If `month` (YYYY-MM) is provided, the COPY scopes to a single file
+    (`yellow_tripdata_YYYY-MM.parquet`) via Snowflake's `FILES = (...)` clause.
+    Otherwise it loads everything currently on the stage (Snowflake's COPY
+    history skips files already loaded, so this is still idempotent).
+    """
+    # Snowflake interprets FILES paths relative to the stage URL
+    # (s3://bucket/raw/), so we pass the bare filename.
+    files_clause = f"\nFILES = ('yellow_tripdata_{month}.parquet')" if month else ""
+
     sql = COPY_SQL.format(
         db=cfg["database"],
         schema=cfg["schema"],
         table=cfg["table"],
         stage=cfg["stage"],
         file_format=cfg["file_format"],
+        files_clause=files_clause,
     )
     with conn.cursor() as cur:
-        log.info("running COPY INTO %s.%s.%s", cfg["database"], cfg["schema"], cfg["table"])
+        scope = f"month={month}" if month else "all staged files"
+        log.info(
+            "running COPY INTO %s.%s.%s (%s)",
+            cfg["database"],
+            cfg["schema"],
+            cfg["table"],
+            scope,
+        )
         cur.execute(sql)
         rows = cur.fetchall()
     for row in rows:
@@ -166,6 +189,14 @@ def _cfg_from_env() -> dict:
 def main(argv: list[str] | None = None) -> int:
     """CLI entry: ensure the table exists then COPY INTO from the external stage."""
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--month",
+        help=(
+            "YYYY-MM tag — load only the matching parquet file via Snowflake's "
+            "FILES clause. Used by the per-month dbt_pipeline DAG. Omit to "
+            "load every file on the stage (Snowflake skips already-loaded ones)."
+        ),
+    )
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args(argv)
 
@@ -178,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
     conn = connect(cfg)
     try:
         ensure_table(conn, cfg)
-        copy_from_stage(conn, cfg)
+        copy_from_stage(conn, cfg, month=args.month)
     finally:
         conn.close()
     return 0

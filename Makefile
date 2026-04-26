@@ -1,8 +1,7 @@
-.PHONY: help setup fmt lint \
+.PHONY: help setup fmt lint test hooks-install requirements status \
         infra-init infra-plan infra-apply infra-destroy \
-        ingest load dbt swap aws-all \
-        spark-submit spark-backfill \
-        streamlit-deploy
+        ingest load dbt dbt-backfill swap aws-all \
+        spark-submit
 
 help:
 	@echo "Common targets:"
@@ -19,17 +18,24 @@ help:
 	@echo "  --- Pipeline (manual / one-shot) ---"
 	@echo "  ingest           Stream TLC parquet -> S3 raw/. Default: current year, only published months."
 	@echo "                   Override: make ingest MONTHS=2023  or  MONTHS=2023-01,2023-02"
-	@echo "  load             COPY INTO from external S3 stage as LOADER role"
-	@echo "  dbt              dbt deps + seed + build + tests + blue-green swap as DBT role"
-	@echo "  aws-all          ingest + load + dbt + streamlit-deploy in sequence"
+	@echo "  load             COPY INTO from external S3 stage as LOADER role."
+	@echo "                   Default: load every staged file. Override: make load MONTH=2023-01 (one file only)"
+	@echo "  dbt              Self-healing dbt build + SWAP as DBT role (dev / smoke test)."
+	@echo "                   No params — dbt detects what to rebuild via count-divergence."
+	@echo "  dbt-backfill     Backfill dbt_pipeline DAG over a month range, sequential."
+	@echo "                   Required: START=YYYY-MM END=YYYY-MM   Optional: FORCE=true"
+	@echo "  aws-all          ingest + load + dbt in sequence"
 	@echo ""
-	@echo "  --- Spark / EMR Serverless ---"
+	@echo "  --- Spark / EMR Serverless (UI is the primary interface) ---"
 	@echo "  spark-submit     Submit one EMR Serverless job ad-hoc (CLI args via ARGS=...)"
-	@echo "  spark-backfill   Backfill spark_pipeline DAG. Defaults: current year up to (today - 2 months)."
-	@echo "                   Override: make spark-backfill START=YYYY-MM END=YYYY-MM [FORCE=true]"
+	@echo "                   Trigger spark_pipeline from the Airflow UI for whole-year"
+	@echo "                   processing — pick year Param, mapped tasks fan out 12 months."
 	@echo ""
-	@echo "  --- Streamlit ---"
-	@echo "  streamlit-deploy PUT streamlit/ files to the Snowflake stage"
+	@echo "  --- Tests + hooks ---"
+	@echo "  test             Run pyspark unit tests for the Spark staging logic"
+	@echo "  hooks-install    Install pre-commit hooks (one-time per clone)"
+	@echo "  requirements     Regenerate requirements.txt + requirements-dev.txt from pyproject.toml"
+	@echo "  status           Show months/years dbt would rebuild on the next run (DBT role)"
 
 # All Snowflake-touching targets go through scripts/with_role.sh so the
 # correct functional role is set per-command (LOADER / DBT / TF). The single
@@ -74,11 +80,23 @@ ingest:
 	uv run python -m ingestion.ingest_tlc --months $(MONTHS)
 
 load:
-	$(WITH_ROLE) loader uv run python -m ingestion.load_snowflake
+	@if [ -n "$(MONTH)" ]; then \
+	    echo "loading file for $(MONTH) only"; \
+	    $(WITH_ROLE) loader uv run python -m ingestion.load_snowflake --month $(MONTH); \
+	else \
+	    echo "loading every staged file (Snowflake skips already-loaded ones)"; \
+	    $(WITH_ROLE) loader uv run python -m ingestion.load_snowflake; \
+	fi
 
+# Self-healing dbt run — every model detects what to rebuild via count-divergence
+# vs the current MARTS state. Mirrors the dbt_pipeline DAG's dbt_build group:
+# deps → clone → load Spark-staged → seed → build → swap. No params needed.
 dbt:
+	@echo "dbt self-healing build (count-divergence detects months to rebuild)"
 	cd dbt && cp -n profiles.yml.example profiles.yml 2>/dev/null || true
 	$(WITH_ROLE) dbt uv run dbt deps  --project-dir dbt --profiles-dir dbt
+	$(WITH_ROLE) dbt uv run dbt run-operation reset_marts_build_from_marts --project-dir dbt --profiles-dir dbt
+	$(WITH_ROLE) dbt uv run dbt run-operation load_spark_staged_into_marts_build --project-dir dbt --profiles-dir dbt
 	$(WITH_ROLE) dbt uv run dbt seed  --project-dir dbt --profiles-dir dbt
 	$(WITH_ROLE) dbt uv run dbt build --project-dir dbt --profiles-dir dbt
 	$(WITH_ROLE) dbt uv run dbt run-operation swap_marts --project-dir dbt --profiles-dir dbt
@@ -87,48 +105,62 @@ dbt:
 swap:
 	$(WITH_ROLE) dbt uv run dbt run-operation swap_marts --project-dir dbt --profiles-dir dbt
 
-aws-all: ingest load dbt streamlit-deploy
+# Backfill dbt_pipeline over a month range. Each DAG run = one month;
+# max_active_runs=1 → sequential. The DAG infers lag_months=0 from
+# run_type=backfill, so START/END are the actual data months processed.
+#   make dbt-backfill START=2023-01 END=2023-12
+#   make dbt-backfill START=2023-06 END=2023-08 FORCE=true
+dbt-backfill:
+	@DBT_START="$(START)"; DBT_END="$(END)"; \
+	if [ -z "$$DBT_START" ] || [ -z "$$DBT_END" ]; then \
+	    echo "ERROR: provide both START=YYYY-MM and END=YYYY-MM"; \
+	    exit 1; \
+	fi; \
+	if [ "$$DBT_START" \> "$$DBT_END" ]; then \
+	    echo "nothing to do: START=$$DBT_START is after END=$$DBT_END"; \
+	    exit 0; \
+	fi; \
+	if [ "$(FORCE)" = "true" ]; then \
+	    CONF_ARG='--conf {"force": true}'; \
+	else \
+	    CONF_ARG=''; \
+	fi; \
+	echo "backfilling dbt_pipeline: $$DBT_START → $$DBT_END  (force=$(FORCE))"; \
+	cd airflow && astro dev run dags backfill dbt_pipeline \
+	    --start-date $${DBT_START}-01 --end-date $${DBT_END}-01 $$CONF_ARG
+
+aws-all: ingest load dbt
 
 # --- Spark ---------------------------------------------------------------
 
-# One-off submission. Pass args via ARGS, e.g.:
+# One-off submission to EMR Serverless directly (bypasses Airflow). Useful
+# when iterating on the Spark job locally; for normal historical processing
+# trigger spark_pipeline from the Airflow UI (year Param + mapped tasks).
 #   make spark-submit ARGS="--year 2023 --month 1"
 spark-submit:
 	uv run python -m spark.submit_emr $(ARGS)
 
-# Backfill the spark_pipeline DAG over a month range, sequentially.
-# Backfill always passes lag_months=0 so START / END are the actual DATA
-# months processed (not subject to the 2-month publishing lag default).
-#
-# Defaults: START = January of the current year. END = (today - 2 months),
-# matching TLC's typical publishing cadence. So a bare `make spark-backfill`
-# processes "current year, everything published" — symmetric with ingest.
-#   make spark-backfill                              # current year, latest published
-#   make spark-backfill START=2020-01 END=2023-12    # explicit range
-#   make spark-backfill START=2020-01 END=2023-12 FORCE=true   # re-process all
-spark-backfill:
-	@SPARK_START="$(START)"; SPARK_END="$(END)"; \
-	if [ -z "$$SPARK_START" ] || [ -z "$$SPARK_END" ]; then \
-	    DEFAULTS=$$(python3 -c "from datetime import date; t=date.today(); ye=t.year-(1 if t.month<=2 else 0); me=(t.month-3)%12+1; print(f'{t.year}-01 {ye}-{me:02d}')"); \
-	    [ -z "$$SPARK_START" ] && SPARK_START=$$(echo $$DEFAULTS | cut -d' ' -f1); \
-	    [ -z "$$SPARK_END" ]   && SPARK_END=$$(echo $$DEFAULTS | cut -d' ' -f2); \
-	    echo "[defaults applied — override with START=YYYY-MM END=YYYY-MM]"; \
-	fi; \
-	if [ "$$SPARK_START" \> "$$SPARK_END" ]; then \
-	    echo "nothing to do: START=$$SPARK_START is after END=$$SPARK_END (TLC may not have published any months of the current year yet)"; \
-	    exit 0; \
-	fi; \
-	if [ "$(FORCE)" = "true" ]; then \
-	    CONF='{"lag_months": 0, "force": true}'; \
-	else \
-	    CONF='{"lag_months": 0}'; \
-	fi; \
-	echo "backfilling spark_pipeline: $$SPARK_START → $$SPARK_END  (force=$(FORCE))"; \
-	cd airflow && astro dev run dags backfill spark_pipeline \
-	    --start-date $${SPARK_START}-01 --end-date $${SPARK_END}-01 \
-	    --conf "$$CONF"
+# --- Tests + hooks -------------------------------------------------------
 
-# --- Streamlit -----------------------------------------------------------
+test:
+	uv run python -m pytest spark/tests -v
 
-streamlit-deploy:
-	$(WITH_ROLE) tf uv run python scripts/deploy_streamlit.py
+# Install the pre-commit hooks defined in .pre-commit-config.yaml.
+# Run once per fresh clone. Hooks fire on every `git commit`.
+hooks-install:
+	uv run pre-commit install
+
+# Regenerate requirements*.txt from pyproject.toml + uv.lock. The repo's
+# canonical dep source-of-truth is pyproject.toml; the txt files are
+# auto-generated mirrors for tools/reviewers that expect "standard" pip
+# requirements. CI runs this and fails if the committed file would differ.
+requirements:
+	uv export --no-hashes --no-dev   > requirements.txt
+	uv export --no-hashes --only-dev > requirements-dev.txt
+
+# Show what dbt would rebuild on the next run. Runs the same count-divergence
+# detection logic the models use, but as a read-only query so you can preview
+# the work without actually building. Returns rows: (model, year, month, fct_count,
+# agg_count) for any month where counts diverge.
+status:
+	$(WITH_ROLE) dbt uv run dbt run-operation show_pending_rebuilds --project-dir dbt --profiles-dir dbt

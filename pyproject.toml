@@ -19,6 +19,7 @@ dev = [
     "dbt-core>=1.8,<1.10",
     "dbt-snowflake>=1.8,<1.10",
     "pyspark>=3.5,<4.0",
+    "pre-commit>=3.8",
 ]
 
 [tool.ruff]

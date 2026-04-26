@@ -1,1 +1,3 @@
-# APT packages to install into the Astro image. Empty for now.
+# APT packages to install into the Astro runtime image.
+# Required to exist (Astro base image has `ONBUILD COPY packages.txt .`)
+# even when empty.

@@ -28,7 +28,7 @@ resource "aws_iam_role" "snowflake_s3" {
 }
 
 data "aws_iam_policy_document" "snowflake_s3_read" {
-  # List the raw/ prefix.
+  # List the raw/ + staged-marts/ prefixes.
   statement {
     effect    = "Allow"
     actions   = ["s3:ListBucket", "s3:GetBucketLocation"]
@@ -37,15 +37,19 @@ data "aws_iam_policy_document" "snowflake_s3_read" {
     condition {
       test     = "StringLike"
       variable = "s3:prefix"
-      values   = ["raw/*", "raw/"]
+      values   = ["raw/*", "raw/", "staged-marts/*", "staged-marts/"]
     }
   }
 
-  # Read parquet objects under raw/.
+  # Read parquet objects under raw/ (TLC monthly files) and staged-marts/
+  # (Spark-staged FCT_TRIPS / FCT_TRIPS_QUARANTINED partitions).
   statement {
-    effect    = "Allow"
-    actions   = ["s3:GetObject", "s3:GetObjectVersion"]
-    resources = ["${aws_s3_bucket.data.arn}/raw/*"]
+    effect  = "Allow"
+    actions = ["s3:GetObject", "s3:GetObjectVersion"]
+    resources = [
+      "${aws_s3_bucket.data.arn}/raw/*",
+      "${aws_s3_bucket.data.arn}/staged-marts/*",
+    ]
   }
 }
 

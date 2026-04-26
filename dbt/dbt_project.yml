@@ -17,22 +17,25 @@ clean-targets:
 
 # Three logical dbt layers, all materialised in the single MARTS_BUILD
 # Snowflake schema (atomically swapped to MARTS on successful build):
-#   staging       → views   (clean + flag, 1:1 with sources)
-#   intermediate  → tables  (atomic facts: int_trips_enriched, int_trips_quarantined
-#                             — exposed as FCT_TRIPS / FCT_TRIPS_QUARANTINED via +alias)
-#   marts         → tables  (aggregate marts: agg_*)
+#   staging       → views        (1:1 with RAW; cast + flag invalid rows)
+#   intermediate  → incremental  (FCT_TRIPS, FCT_TRIPS_QUARANTINED)
+#   marts         → incremental  (AGG_*)
 #
-# agg_zone_supply_gaps overrides to incremental (see its config block).
+# Self-healing incremental design: every dbt run discovers what to rebuild
+# from the data itself, not from parameters. Each model's source CTE
+# computes "months whose row count in the source layer diverges from the
+# count reflected in the target" (with a min-row threshold to ignore TLC's
+# tiny cross-month tail-bleed). Detection is data-driven, not date-driven —
+# so a single dbt run handles live monthly ingestion AND historical Spark
+# backfill output AND late-arriving leak-row corrections, identically.
 models:
   analytics:
     staging:
       +materialized: view
       +schema: marts_build
     intermediate:
-      +materialized: table
       +schema: marts_build
     marts:
-      +materialized: table
       # Blue-green: dbt writes marts into MARTS_BUILD. After all mart tests
       # pass, the swap_marts macro atomically flips MARTS_BUILD ↔ MARTS so
       # dashboards (which read MARTS) see the new build instantly. If any
@@ -51,10 +54,14 @@ seeds:
         service_zone: STRING
 
 vars:
-  # Year gate for the staging validity rules and demos.
-  taxi_year: 2023
   # Row-count sanity bounds for the singular test (±40% month-over-month, per the plan).
   monthly_rowcount_tolerance: 0.40
   # Minimum monthly volume before the M-over-M comparison runs. Avoids false
   # positives from partial-month tails (e.g. a single Feb row in the Jan file).
   monthly_rowcount_min: 10000
+  # Phantom-month threshold for incremental detection: a (year, month) only
+  # gets aggregated for the FIRST time once it has at least this many rows
+  # in the source layer. Stops TLC's cross-month tail-bleed (~100 rows that
+  # leak into the wrong file) from creating partial-month aggregates.
+  # Real NYC monthly volume is ~3M rows, so 100k is a wide safety margin.
+  phantom_month_threshold: 100000

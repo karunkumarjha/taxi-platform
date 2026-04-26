@@ -1,9 +1,10 @@
 {{
     config(
-        materialized = 'incremental',
-        unique_key   = ['pickup_date', 'pu_location_id'],
-        cluster_by   = ['pickup_date', 'pu_location_id'],
-        on_schema_change = 'sync_all_columns',
+        materialized        = 'incremental',
+        unique_key          = ['pickup_date', 'pu_location_id'],
+        incremental_strategy= 'delete+insert',
+        on_schema_change    = 'sync_all_columns',
+        cluster_by          = ['pickup_date', 'pu_location_id'],
     )
 }}
 
@@ -17,13 +18,40 @@
 --   • trip_count        — trips that day (context for the gaps)
 --   • gaps_gt_1h / gaps_gt_3h — how many "long" gaps that day
 --
--- Why incremental: this mart is the single most expensive one in the project
--- (per-zone sorted window across ~38M rows). Running it incrementally on
--- pickup_date lets backfills + daily runs cost ~O(new data), not O(full history).
--- See README brainstormer (expensive query) for the Snowflake-specific tuning
--- options — clustering on (pickup_date, pu_location_id) complements incremental.
+-- Month-grain self-healing incremental: detect months where this mart's
+-- summed trip_count (rolled up from per-day rows) diverges from FCT_TRIPS'
+-- row count for that month, OR a new month has crossed the phantom threshold.
+-- The per-zone LAG window then runs over only the divergent months — much
+-- cheaper than the original full-history scan.
 
-with trips as (
+with fct_month_counts as (
+    select pickup_year, pickup_month, count(*) as fct_cnt
+    from {{ ref('int_trips_enriched') }}
+    group by 1, 2
+),
+
+months_to_build as (
+    select fct.pickup_year, fct.pickup_month
+    from fct_month_counts fct
+    {% if is_incremental() %}
+    left join (
+        select
+            extract(year  from pickup_date)::int as pickup_year,
+            extract(month from pickup_date)::int as pickup_month,
+            sum(trip_count) as agg_cnt
+        from {{ this }}
+        group by 1, 2
+    ) agg using (pickup_year, pickup_month)
+    where
+        (agg.agg_cnt is not null and agg.agg_cnt != fct.fct_cnt)
+        or
+        (agg.agg_cnt is null and fct.fct_cnt >= {{ var('phantom_month_threshold') }})
+    {% else %}
+    where fct.fct_cnt >= {{ var('phantom_month_threshold') }}
+    {% endif %}
+),
+
+trips as (
     select
         pickup_date,
         pu_location_id,
@@ -31,10 +59,9 @@ with trips as (
         pu_zone,
         pickup_ts
     from {{ ref('int_trips_enriched') }}
-    {% if is_incremental() %}
-      -- Only rescan days newer than whatever we already have.
-      where pickup_date >= (select coalesce(max(pickup_date), '1970-01-01'::date) from {{ this }})
-    {% endif %}
+    where (pickup_year, pickup_month) in (
+        select pickup_year, pickup_month from months_to_build
+    )
 ),
 
 with_gaps as (

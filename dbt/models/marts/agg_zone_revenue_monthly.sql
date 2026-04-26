@@ -1,21 +1,58 @@
 {{
     config(
-        materialized = 'table',
-        cluster_by   = ['pickup_year', 'pickup_month'],
+        materialized        = 'incremental',
+        unique_key          = ['pickup_year', 'pickup_month', 'pu_location_id'],
+        incremental_strategy= 'delete+insert',
+        on_schema_change    = 'sync_all_columns',
+        cluster_by          = ['pickup_year', 'pickup_month'],
     )
 }}
 
--- Business Q1: Which pickup zones generate the most revenue across 2023, and
--- does the ranking shift meaningfully by month?
+-- Business Q1: Which pickup zones generate the most revenue across the year?
 --
 -- Grain: one row per (pickup_year, pickup_month, pu_location_id).
--- Serves both the Snowsight dashboard (ranked bar + month slicer) and queries/.
+-- Serves the dashboard (ranked bar + month slicer) and queries/01_zone_revenue.sql.
 --
--- Why include rank + year totals + month-over-month movement here (not in the
--- query): these aggregates are read repeatedly and we don't want each dashboard
--- tile re-scanning ~38M rows. Pre-computing keeps Snowsight queries cheap.
+-- Year-grain self-healing incremental: yearly_gross_revenue and
+-- yearly_revenue_rank depend on cross-month state, so when ANY month within
+-- a year changes, the WHOLE year is rebuilt from FCT_TRIPS. Detection runs
+-- at the year level (sum of row counts per year compared between fct and
+-- this mart) — a divergent year triggers a rebuild for all of its months.
+--
+-- Cost tradeoff (deliberate): full-year rebuild is O(year-rows) — for 2023
+-- that's ~38M rows scanned per divergent run, even when only ~3M (one month's
+-- additions) actually changed. We accept the wasted scan in exchange for
+-- correctness simplicity: yearly_* fields stay consistent without bookkeeping
+-- a per-row "year_total dirty" flag. At Snowflake WH_XS this rebuild takes
+-- ~30-60s, dominated by the COUNT/SUM aggregations Snowflake handles in
+-- columnstore. At 1.5B-row scale this would be the place to revisit (e.g.,
+-- streams + tasks for true row-level incremental).
 
-with monthly as (
+with fct_year_counts as (
+    select pickup_year, count(*) as fct_cnt
+    from {{ ref('int_trips_enriched') }}
+    group by 1
+),
+
+years_to_rebuild as (
+    select fct.pickup_year
+    from fct_year_counts fct
+    {% if is_incremental() %}
+    left join (
+        select pickup_year, sum(trip_count) as agg_cnt
+        from {{ this }}
+        group by 1
+    ) agg using (pickup_year)
+    where
+        (agg.agg_cnt is not null and agg.agg_cnt != fct.fct_cnt)
+        or
+        (agg.agg_cnt is null and fct.fct_cnt >= {{ var('phantom_month_threshold') }})
+    {% else %}
+    where fct.fct_cnt >= {{ var('phantom_month_threshold') }}
+    {% endif %}
+),
+
+monthly as (
     select
         pickup_year,
         pickup_month,
@@ -28,13 +65,11 @@ with monthly as (
         sum(tip_amount)     as tip_revenue,
         avg(total_amount)   as avg_revenue_per_trip
     from {{ ref('int_trips_enriched') }}
+    where pickup_year in (select pickup_year from years_to_rebuild)
     group by 1, 2, 3, 4, 5
 ),
 
 ranked as (
-    -- First pass: per-month rank only. Snowflake doesn't allow window functions
-    -- nested inside other window functions, so the LAG over this rank lives
-    -- in the next CTE.
     select
         *,
         rank() over (
@@ -44,24 +79,12 @@ ranked as (
     from monthly
 ),
 
-ranked_with_prev as (
-    -- Second pass: month-over-month rank movement.
-    -- + = zone climbed vs prior month, - = slid down.
-    select
-        *,
-        lag(revenue_rank_in_month) over (
-            partition by pu_location_id
-            order by pickup_year, pickup_month
-        ) as prev_month_rank
-    from ranked
-),
-
 year_totals as (
     select
         pickup_year,
         pu_location_id,
-        sum(gross_revenue)                                            as yearly_gross_revenue,
-        rank() over (partition by pickup_year order by sum(gross_revenue) desc) as yearly_revenue_rank
+        sum(gross_revenue)                                                       as yearly_gross_revenue,
+        rank() over (partition by pickup_year order by sum(gross_revenue) desc)  as yearly_revenue_rank
     from monthly
     group by 1, 2
 )
@@ -78,14 +101,9 @@ select
     r.tip_revenue,
     r.avg_revenue_per_trip,
     r.revenue_rank_in_month,
-    r.prev_month_rank,
-    case
-        when r.prev_month_rank is null then null
-        else r.prev_month_rank - r.revenue_rank_in_month   -- + = climbed ranks
-    end as rank_change_vs_prev_month,
     y.yearly_gross_revenue,
     y.yearly_revenue_rank
-from ranked_with_prev r
+from ranked r
 left join year_totals y
   on y.pickup_year = r.pickup_year
  and y.pu_location_id = r.pu_location_id

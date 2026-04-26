@@ -7,6 +7,9 @@
 -- Staging for the TLC Yellow Taxi trips.
 --
 -- Design choices:
+--   • Stays a view — 1:1 reflection of RAW. Per-month scoping happens in the
+--     downstream incremental models (int_trips_enriched, int_trips_quarantined),
+--     not here, so the view's definition is independent of any single run.
 --   • Cast + rename at the boundary so the rest of dbt uses consistent names
 --     (pickup_ts, dropoff_ts, pickup_date, pickup_hour, pickup_dow).
 --   • Do NOT drop invalid rows here. Tag them with is_valid + invalid_reason so
@@ -40,6 +43,7 @@ casted as (
         total_amount::float                    as total_amount,
         congestion_surcharge::float            as congestion_surcharge,
         airport_fee::float                     as airport_fee,
+        cbd_congestion_fee::float              as cbd_congestion_fee,
         _source_filename                       as source_filename,
         _loaded_at                             as loaded_at
     from source
@@ -87,7 +91,6 @@ flagged as (
             -- taxi ride — almost always meters left running overnight or a
             -- meter glitch. Same threshold as the trip_duration_sane test.
             when trip_duration_min > 720                           then 'duration_out_of_range'
-            when pickup_year != {{ var('taxi_year') }}             then 'pickup_year_mismatch'
             when trip_distance is null or trip_distance <= 0       then 'non_positive_distance'
             when trip_distance > 200                               then 'distance_out_of_range'
             when fare_amount < 0 or total_amount < 0               then 'negative_fare_or_total'
@@ -138,6 +141,7 @@ select
     total_amount,
     congestion_surcharge,
     airport_fee,
+    cbd_congestion_fee,
     tip_pct,
     invalid_reason,
     invalid_reason is null                     as is_valid,
