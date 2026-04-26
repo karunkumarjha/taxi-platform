@@ -13,54 +13,7 @@ ingestion, transformation, and the historical Spark roll-up.
 
 ## Architecture
 
-```
-                        TLC CloudFront (parquet, monthly drops)
-                                       │
-                  ingestion/ingest_tlc.py  (stream, smart-resume)
-                                       │
-                                       ▼
-                  ┌──── S3:  analytics-data-<suffix>  ────┐
-                  │   raw/                                │
-                  │   analytics/daily_zone_aggregates/    │
-                  │   spark-scripts/                      │
-                  │   spark-logs/                         │
-                  └──┬─────────────────────────────────┬──┘
-                     │ Snowflake STORAGE INTEGRATION   │ EMR Serverless
-                     │ (assume IAM role; no AWS keys)  │ (boto3 submit)
-                     ▼                                 ▼
-       Snowflake @ANALYTICS.RAW.S3_TLC_STAGE     spark/process_historical.py
-                     │                                 │
-       COPY INTO     │                  one Spark job  │
-       (LOADER role) │                  per month      │
-                     ▼                                 ▼
-       ANALYTICS.RAW.YELLOW_TRIPDATA       analytics/year=YYYY/month=MM/
-                     │                       (partitioned daily-grain parquet)
-                     │
-                     │  dbt (DBT role; blue-green via SWAP)
-                     ▼
-       ANALYTICS.MARTS_BUILD     ──ALTER SCHEMA SWAP──>     ANALYTICS.MARTS
-       ┌──────────────────────────┐                         ┌──────────────────────────┐
-       │ STG_YELLOW_TRIPS  (view) │                         │ DIM_ZONES                │
-       │ DIM_ZONES                │                         │ FCT_TRIPS                │
-       │ FCT_TRIPS                │                         │ FCT_TRIPS_QUARANTINED    │
-       │ FCT_TRIPS_QUARANTINED    │                         │ AGG_ZONE_REVENUE_MONTHLY │
-       │ AGG_*                    │                         │ AGG_HOURLY_DEMAND        │
-       └──────────────────────────┘                         │ AGG_ZONE_SUPPLY_GAPS     │
-                                                            │ AGG_ZONE_TIP_BEHAVIOUR   │
-                                                            └─────────────┬────────────┘
-                                                                          │
-                                                          DASHBOARD role  ▼
-                                                          STREAMLIT  ANALYTICS_APP
-                                                          (Snowsight → Streamlit)
-
-Orchestration                                Snowflake RBAC
-─────────────                                ──────────────
-Airflow DAGs (Astro CLI):                     LOADER     — write RAW only
-  dbt_pipeline    @daily                      DBT        — own STAGING + MARTS_*; SELECT on RAW
-  spark_pipeline  @monthly                    DASHBOARD  — read MARTS + Streamlit
-                                              ANALYST    — read everything (no writes)
-                                              (TF_USER   — ACCOUNTADMIN, Terraform only)
-```
+![taxi-platform architecture](docs/architecture.png)
 
 ---
 
