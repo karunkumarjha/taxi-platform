@@ -12,16 +12,15 @@ COPY.
 
 ## Video walkthroughs
 
-Watch these first — they cover the architecture and a live end-to-end
+Watch this first — a one-shot code walkthrough plus a live end-to-end
 run. The README below has the same content in text form for reference.
 
-- **[Taxi Platform — architecture and project structure](https://www.loom.com/share/7a0ba2d0f1f548d8b80a2ecff2e53dae)**
+- **[Taxi Platform — code walkthrough and end-to-end run](https://drive.google.com/file/d/12Zfs1rAaKSMdnvZLAQpozYTkVZvsr12s/view?usp=sharing)**
   — repo tour and the architectural decisions worth calling out (predicted
   IAM ARN for single-apply Terraform, self-healing dbt via count-divergence,
-  natural-key dedup, clone-before-build, Spark↔S3↔dbt unification).
-- **[End-to-end pipeline setup and run](https://www.loom.com/share/8d0005513f8c4bfb9d5b0486bc1b3d06)**
-  — full demo from a fresh clone through `./scripts/bootstrap.sh` to the
-  Airflow DAGs running and data landing in Snowflake.
+  natural-key dedup, clone-before-build, Spark↔S3↔dbt unification),
+  followed by a full demo from a fresh clone through `./scripts/bootstrap.sh`
+  to the Airflow DAGs running and data landing in Snowflake.
 
 ## Table of contents
 
