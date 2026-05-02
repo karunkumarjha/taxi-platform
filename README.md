@@ -57,12 +57,32 @@ DAG ingests the live monthly TLC drop, COPYs any new Spark batches into
 `MARTS_BUILD`, runs self-healing incremental dbt, and atomically swaps
 the result into `MARTS`. Single-writer-to-Snowflake, no race conditions.
 
+**Dual-trigger `dbt_pipeline`.** The DAG runs on
+`DatasetOrTimeSchedule(@monthly, SPARK_STAGE_DATASET)` — whichever
+fires first. The `@monthly` cron is the live path (ingest TLC + COPY
+any pending Spark batches + dbt build + swap); every scheduled run
+unconditionally calls `load_spark_staged_into_marts_build`, so Spark
+batches sitting in `s3://.../staged-marts/` get picked up on the next
+scheduled tick even if no one re-triggered anything. The Dataset path
+fires the moment `spark_pipeline` completes (skipping the TLC ingest
+since Spark already produced the data) — no waiting for the next
+cron tick. Either path produces the same MARTS state; the Dataset
+trigger just shortens the latency.
+
 ### Architecture decisions worth calling out
 
 - **Single `terraform apply` across AWS + Snowflake.** The classic
   storage-integration ↔ IAM-role circular dependency is broken by
   *predicting the IAM role ARN* and giving it to the integration as a
   string at create time.
+- **`spark_pipeline` → `dbt_pipeline` via Airflow Datasets.** Both DAGs
+  declare the same `Dataset("spark+s3://staged-marts/fct_trips")` URI.
+  `spark_pipeline`'s final task lists it as an `outlet`; `dbt_pipeline`'s
+  schedule is `DatasetOrTimeSchedule(@monthly, dataset)`. Spark
+  completion fires a dataset event → scheduler triggers a `dbt_pipeline`
+  run that skips TLC ingest and goes straight to COPY + build + swap.
+  Caveat: the consumer DAG must be unpaused to receive the event;
+  events queued while paused do fire on unpause (most recent only).
 - **Self-healing incremental dbt (no params).** Each model's source CTE
   compares per-(year, month) row counts against the target table.
   Months/years where counts diverge get rebuilt; matching ones are
