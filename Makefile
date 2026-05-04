@@ -199,7 +199,8 @@ status:
 # Port 8081 to avoid clashing with Airflow's UI on 8080. Requires
 # `make infra-apply` to have run (dbt introspects Snowflake's catalog).
 docs:
-	$(WITH_ROLE) dbt uv run dbt docs generate --project-dir dbt --profiles-dir dbt
+	$(WITH_ROLE) dbt uv run dbt docs generate --project-dir dbt --profiles-dir dbt \
+	    --vars '{target_year: 2023, target_month: 1}'
 	@echo ""
 	@echo "  → opening dbt docs at http://localhost:8081 (Ctrl-C to stop)"
 	@echo ""
