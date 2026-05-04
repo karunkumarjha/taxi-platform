@@ -94,8 +94,8 @@ jobs:
       - name: Airflow DagBag load test
         run: |
           uv run --with 'apache-airflow==3.0.6' \
-                 --with 'apache-airflow-providers-snowflake==6.4.1' \
-                 --with 'apache-airflow-providers-amazon==9.10.0' \
+                 --with 'apache-airflow-providers-snowflake==6.12.2' \
+                 --with 'apache-airflow-providers-amazon==9.27.0' \
                  python -c "
           import sys; sys.path.insert(0, 'airflow')
           from airflow.models import DagBag
