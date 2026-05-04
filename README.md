@@ -514,6 +514,7 @@ spark/         process_historical.py — daily pre-aggregation script that
                EMR Serverless executes (uploaded to s3://.../spark-scripts/
                by bootstrap; re-deploy with `make spark-deploy`)
 queries/       SQL queries answering Q1–Q4 (one file per business question)
+               + validation_queries.sql (live vs. historical sanity checks)
 scripts/       bootstrap.sh, with_role.sh credential wrapper, dbt_parse_hook.sh
 .github/       CI workflow
 ```

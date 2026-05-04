@@ -63,11 +63,11 @@ setup:
 	uv sync
 
 fmt:
-	uv run ruff format ingestion airflow/dags scripts
+	uv run ruff format ingestion airflow/dags scripts spark
 	cd infra && terraform fmt -recursive
 
 lint:
-	uv run ruff check ingestion airflow/dags scripts
+	uv run ruff check ingestion airflow/dags scripts spark
 
 # --- Infra ---------------------------------------------------------------
 
