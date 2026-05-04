@@ -178,6 +178,21 @@ reading the previous good build.
   doesn't block 2024-04, 2024-05, … — Airflow runs them in queue order;
   the failure surfaces in the UI for that specific month only.
 
+- **`@monthly` schedule, not `@daily` — matched to the data's actual cadence.**
+  TLC publishes Yellow Taxi parquet monthly, with a ~2-month lag. A
+  `@daily` schedule would produce ~30 no-op DagRuns per month (HEAD-skip
+  ingest, COPY re-loads the same file, snapshot strategy=check no-ops,
+  dbt incrementals merge zero new rows) — at 38M rows/year on WH_XS
+  that's ~$2/month of wasted compute. At 1.5B-row historical scale on a
+  warehouse sized for the workload, the same `@daily` choice would burn
+  meaningful credits for no analytical signal. The pipeline is fully
+  idempotent (HEAD-skip, `FORCE=TRUE` with `_ingest_batch_id` audit,
+  snapshot=check, merge on `trip_bk`) so daily would *work*; we just
+  match the schedule to when new data actually arrives. For ad-hoc /
+  per-day operator needs, the same DAG accepts `airflow dags trigger`
+  with conf, and `make dbt-backfill` runs date-range backfills — both
+  on whatever cadence the operator wants.
+
 - **Blue-green deploy with clone-before-build.** Each run does
   `CREATE OR REPLACE TRANSIENT TABLE MARTS_BUILD.<t> CLONE MARTS.<t>`
   per table at the start (preserves FUTURE-TABLE grants vs schema-level
