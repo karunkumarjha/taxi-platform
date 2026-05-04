@@ -14,7 +14,7 @@ Approach
 3. Aggregate by (pu_location_id, distance_bucket) with p50/p90 via
    APPROX_PERCENTILE, and compare each zone's p50 to the city-wide p50 using
    a window function — lets us flag "zones that tip >2pp above / below average".
-4. QUALIFY to keep only zones with a statistically meaningful sample
+4. Filter to zones with a statistically meaningful sample
    (>= 1000 credit-card trips in the bucket).
 
 SQL features used
@@ -23,7 +23,7 @@ SQL features used
   clearer for named buckets).
 * Window function to compare per-zone p50 to the global p50 (deviation).
 * APPROX_PERCENTILE for tip_pct distribution.
-* QUALIFY to drop low-volume zones before output.
+* Final WHERE on `trip_count` drops low-volume zones from the output.
 
 Performance on Snowflake (38M rows)
 -----------------------------------
@@ -95,5 +95,5 @@ SELECT
     ROUND(city_avg_p50_tip_pct * 100, 2)      AS city_avg_p50_tip_pct,
     ROUND(p50_tip_pct_deviation * 100, 2)     AS p50_tip_pct_deviation_pp
 FROM with_baseline
-QUALIFY trip_count >= 1000
+WHERE trip_count >= 1000
 ORDER BY distance_bucket, p50_tip_pct_deviation DESC;
