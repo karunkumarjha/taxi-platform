@@ -14,7 +14,7 @@ history and SCD Type 2 versioning for retroactive TLC corrections.
 Watch this first — a one-shot code walkthrough plus a live end-to-end
 run. The README below has the same content in text form for reference.
 
-- **[Taxi Platform — code walkthrough and end-to-end run](https://drive.google.com/file/d/12Zfs1rAaKSMdnvZLAQpozYTkVZvsr12s/view?usp=sharing)**
+- **[Taxi Platform — code walkthrough and end-to-end run](https://drive.google.com/file/d/1TIV1tkNmbRhdhN273OEJwoL9SymTFghi/view?usp=sharing)**
   — repo tour and the architectural decisions worth calling out (predicted
   IAM ARN for single-apply Terraform, medallion layout with SCD Type 2,
   trip_bk-based merge for TLC corrections, blue-green swap),
