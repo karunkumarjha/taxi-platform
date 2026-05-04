@@ -2,11 +2,10 @@
     reset_marts_build_from_marts — refresh MARTS_BUILD to mirror production
                                     MARTS at the start of every dbt run.
 
-    Why: every dbt model is incremental and uses count-divergence detection
+    Why: every dbt model is incremental — the merge into FCT_TRIPS upserts
     against {{ this }} = MARTS_BUILD.<table>. After swap_marts, MARTS_BUILD
     holds the OLD production state (one swap behind), so the next run would
-    detect divergence against stale data and SWAP a corrupt result into MARTS
-    — every run would produce a wrong-state MARTS.
+    extend stale data and SWAP a wrong-state result into MARTS.
 
     Solution: at the start of every run, clone each TABLE from MARTS into
     MARTS_BUILD so the incremental build extends current production state.

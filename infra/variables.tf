@@ -5,7 +5,7 @@ variable "project_name" {
 }
 
 variable "aws_region" {
-  description = "AWS region for S3 + IAM + (Phase 2) EMR"
+  description = "AWS region for S3 + IAM"
   type        = string
   default     = "us-east-1"
 }

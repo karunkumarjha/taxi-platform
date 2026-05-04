@@ -44,5 +44,9 @@ sources:
             description: "1=credit, 2=cash, 3=no charge, 4=dispute, 5=unknown, 6=voided."
           - name: _source_filename
             description: "S3 filename the row came from (COPY INTO metadata)."
+          - name: _ingest_batch_id
+            description: "UUID4 per COPY call. Distinguishes load events when the same parquet is re-loaded (FORCE=TRUE)."
+          - name: _loaded_by
+            description: "Caller name (dbt_pipeline, manual). Lets analysts attribute each row to its load source."
           - name: _loaded_at
             description: "Pipeline load timestamp (defaulted at COPY)."

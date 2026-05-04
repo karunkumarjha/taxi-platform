@@ -28,3 +28,8 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# Module docstring contains shell command examples whose --conf flags
+# can't be split (key=value is a single shell arg).
+"spark/process_historical.py" = ["E501"]

@@ -8,7 +8,7 @@ terraform {
     }
     snowflake = {
       source  = "snowflakedb/snowflake"
-      version = "~> 0.100"
+      version = "~> 1.0"
     }
     random = {
       source  = "hashicorp/random"
@@ -35,6 +35,16 @@ provider "snowflake" {
   account_name      = var.snowflake_account_name
   role              = var.snowflake_role
   warehouse         = var.snowflake_bootstrap_warehouse
+
+  # Several resources are still flagged "preview" in the v1.x track even
+  # though they're stable enough for production use. We opt into the
+  # specific ones this project depends on; the provider is otherwise GA.
+  preview_features_enabled = [
+    "snowflake_file_format_resource",
+    "snowflake_storage_integration_resource",
+    "snowflake_external_volume_resource",
+    "snowflake_stage_resource",
+  ]
 }
 
 data "aws_caller_identity" "current" {}

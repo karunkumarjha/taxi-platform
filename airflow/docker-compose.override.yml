@@ -5,23 +5,24 @@
 #      via the same profile/SSO setup the host uses.
 # Read-only mounts (`:ro`) keep the container from accidentally mutating
 # host source. dbt/ is mounted writable because dbt writes target/ + logs/.
+#
+# Airflow 3.x service topology (Astro Runtime 3.x): the `webserver` service
+# from 2.x was replaced by `api-server`, and `dag-processor` is now a
+# mandatory standalone service (was optional in 2.x). All four services
+# need the same volume mounts so DAG parsing + execution see the source.
+
+x-mounts: &mounts
+  - ../ingestion:/usr/local/airflow/ingestion:ro
+  - ../spark:/usr/local/airflow/spark:ro
+  - ../dbt:/usr/local/airflow/dbt
+  - ${HOME}/.aws:/home/astro/.aws:ro
 
 services:
   scheduler:
-    volumes:
-      - ../ingestion:/usr/local/airflow/ingestion:ro
-      - ../spark:/usr/local/airflow/spark:ro
-      - ../dbt:/usr/local/airflow/dbt
-      - ${HOME}/.aws:/home/astro/.aws:ro
-  webserver:
-    volumes:
-      - ../ingestion:/usr/local/airflow/ingestion:ro
-      - ../spark:/usr/local/airflow/spark:ro
-      - ../dbt:/usr/local/airflow/dbt
-      - ${HOME}/.aws:/home/astro/.aws:ro
+    volumes: *mounts
+  api-server:
+    volumes: *mounts
   triggerer:
-    volumes:
-      - ../ingestion:/usr/local/airflow/ingestion:ro
-      - ../spark:/usr/local/airflow/spark:ro
-      - ../dbt:/usr/local/airflow/dbt
-      - ${HOME}/.aws:/home/astro/.aws:ro
+    volumes: *mounts
+  dag-processor:
+    volumes: *mounts

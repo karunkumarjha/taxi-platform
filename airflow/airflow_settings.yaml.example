@@ -48,11 +48,19 @@ airflow:
       variable_value: __S3_BUCKET__
     - variable_name: s3_raw_prefix
       variable_value: raw/
+    - variable_name: aws_region
+      variable_value: __AWS_REGION__
+    # ---- EMR Serverless (used by the spark_historical DAG) ----
     - variable_name: emr_application_id
       variable_value: __EMR_APPLICATION_ID__
     - variable_name: emr_exec_role_arn
       variable_value: __EMR_EXEC_ROLE_ARN__
-    - variable_name: aws_region
-      variable_value: __AWS_REGION__
+    # ---- Iceberg + Glue (used by the spark_historical DAG) ----
+    - variable_name: glue_database
+      variable_value: __GLUE_DATABASE_NAME__
+    - variable_name: snowflake_external_volume
+      variable_value: __SNOWFLAKE_EXTERNAL_VOLUME__
+    - variable_name: snowflake_catalog_integration
+      variable_value: __SNOWFLAKE_CATALOG_INTEGRATION__
 
   pools: []

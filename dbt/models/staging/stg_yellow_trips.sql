@@ -7,23 +7,26 @@
 -- Staging for the TLC Yellow Taxi trips.
 --
 -- Design choices:
---   • Stays a view — 1:1 reflection of RAW. Per-month scoping happens in the
---     downstream incremental models (int_trips_enriched, int_trips_quarantined),
---     not here, so the view's definition is independent of any single run.
---   • Cast + rename at the boundary so the rest of dbt uses consistent names
---     (pickup_ts, dropoff_ts, pickup_date, pickup_hour, pickup_dow).
+--   • Reads from snp_yellow_trips (Silver SCD snapshot) WHERE dbt_valid_to
+--     IS NULL — that's dbt's idiom for "current SCD version of each row"
+--     (older versions have a closed dbt_valid_to timestamp). The full
+--     SCD history (past corrections) lives in the snapshot for audit queries.
+--   • Stays a view — per-month scoping happens in the downstream incremental
+--     models (int_trips_enriched, int_trips_quarantined), not here.
+--   • Cast + rename at the boundary so the rest of dbt uses consistent names.
 --   • Do NOT drop invalid rows here. Tag them with is_valid + invalid_reason so
---     downstream layers can split cleanly — int_trips_enriched keeps only valid
---     rows, int_trips_quarantined keeps the rest as an audit trail.
+--     downstream layers can split cleanly.
 --   • Validity rules match the README "dirty records" section. Order matters:
 --     rules are evaluated top-down and the first failure sets invalid_reason.
 
 with source as (
-    select * from {{ source('raw', 'yellow_tripdata') }}
+    select * from {{ ref('snp_yellow_trips') }}
+    where dbt_valid_to is null
 ),
 
 casted as (
     select
+        trip_bk,
         vendorid::integer                      as vendor_id,
         tpep_pickup_datetime::timestamp_ntz    as pickup_ts,
         tpep_dropoff_datetime::timestamp_ntz   as dropoff_ts,
@@ -67,15 +70,14 @@ derived as (
             when fare_amount > 0 then tip_amount / fare_amount
             else null
         end                                                       as tip_pct,
-        -- Detect duplicate raw rows. TLC's source data contains a small
-        -- number of true duplicates (vendor recorded the same trip twice).
-        -- We pick the first occurrence (by source_filename, deterministic)
-        -- and quarantine the rest as 'duplicate_row'.
+        -- Detect duplicate raw rows. Partition on the 5 immutable trip
+        -- identifiers (the same columns that define trip_bk). Mutable
+        -- attributes (fare_amount, etc.) are intentionally excluded so
+        -- TLC corrections don't create false duplicates.
         row_number() over (
             partition by
                 vendor_id, pickup_ts, dropoff_ts,
-                pu_location_id, do_location_id,
-                fare_amount, total_amount, payment_type
+                pu_location_id, do_location_id
             order by source_filename
         )                                                         as dup_rank
     from casted
@@ -112,10 +114,7 @@ flagged as (
 )
 
 select
-    {{ dbt_utils.generate_surrogate_key([
-        'vendor_id', 'pickup_ts', 'dropoff_ts', 'pu_location_id',
-        'do_location_id', 'fare_amount', 'total_amount', 'source_filename'
-    ]) }}                                      as trip_sk,
+    trip_bk,
     vendor_id,
     pickup_ts,
     dropoff_ts,

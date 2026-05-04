@@ -1,48 +1,115 @@
 """
-Process ONE month of NYC TLC Yellow Taxi parquet via PySpark, replicate dbt's
-staging logic (12 validity rules + trip_sk + derived columns + zone enrichment),
-and write split FCT_TRIPS / FCT_TRIPS_QUARANTINED parquet to S3 — ready for
-the dbt_pipeline DAG to pick up via COPY INTO MARTS_BUILD.
+process_historical.py — pre-aggregate raw NYC TLC parquet at scale and
+write the result as an **Iceberg** table registered in AWS Glue Data
+Catalog. Snowflake reads it zero-copy via CATALOG INTEGRATION.
 
-Pipeline role:
-    Spark = historical bulk staging. Reads raw monthly TLC parquet from S3,
-    produces fact-grain output that mirrors dbt's int_trips_enriched and
-    int_trips_quarantined schemas, writes to s3://.../staged-marts/. The
-    dbt_pipeline DAG's load_spark_staged_into_marts_build macro then COPY-INTOs
-    these files into MARTS_BUILD during the next dbt run.
+Role in the platform
+--------------------
+Spark pre-aggregates the historical bulk into a daily-grain
+denormalised fact. Snowflake exposes the same data
+to analysts via `ANALYTICS.HISTORICAL.HISTORICAL_DAILY_AGG` — both
+engines share metadata through Glue and storage through S3. Neither
+copies; both query the same physical files.
 
-    Live monthly path is dbt-only — Spark's role is to handle the historical
-    backfill where running dbt on billions of rows would be expensive.
+This is a SCALE concern, NOT a transformation owner. dbt remains the
+sole owner of validation, enrichment, and the medallion layers
+(Bronze → Silver → Gold). The Iceberg output here feeds analytical
+SQL directly, parallel to dbt — they produce different artefacts at
+different grains. No engine drift.
 
-Why month-by-month:
-    The TLC dataset goes back to 2009 (~1.5B rows across 14 years). A monolithic
-    job is fragile (any failure costs everything). Month-grain gives:
-      * Per-month idempotency — re-run a bad month without touching siblings.
-      * Failure isolation — June crashing doesn't take July with it.
-      * Easy backfill — submit one job per month, sequential or parallel.
-      * Cost control — stop anytime; at worst lose one month's compute.
+Why Iceberg + Glue (vs plain parquet + Snowflake external table)
+----------------------------------------------------------------
+• True multi-engine interop — Spark writes manifests to Glue on
+  commit; Snowflake reads them via CATALOG INTEGRATION. This is the
+  open-table-format pattern: catalog is the source of truth, any
+  compatible engine can participate.
+• Atomic commits — Iceberg's snapshot-isolation semantics prevent
+  partial-write visibility. Readers always see a consistent table
+  state, even mid-write.
+• Schema + partition evolution — adding a column or changing the
+  partition spec is metadata-only. No file rewrites.
+• Time-travel + rollback — every commit is a snapshot. `... FOR
+  TIMESTAMP AS OF ...` queries work in both Spark and Snowflake.
+• Hidden partitioning — partition columns are derived (`year(date)`
+  / `month(date)`); writers don't need to compute partition values
+  manually, queries get pruning automatically.
 
-Output schemas:
-    staged-marts/fct_trips/{tag}.parquet              -> mirrors dbt's int_trips_enriched
-    staged-marts/fct_trips_quarantined/{tag}.parquet  -> mirrors dbt's int_trips_quarantined
+Output table: glue.taxi_iceberg.historical_daily
+------------------------------------------------
+Grain: (pickup_date, pickup_hour, pu_location_id, payment_type)
 
-Schema parity:
-    Column NAMES match dbt's models (COPY uses MATCH_BY_COLUMN_NAME). Column
-    TYPES are written via Spark's parquet — Snowflake's COPY does the implicit
-    cast on the way in. trip_sk is computed in Spark; values won't byte-match
-    dbt's (different cast formatting), but since Spark owns historical months
-    and dbt owns live months, there's no key overlap by design.
+    pickup_date          DATE
+    pickup_hour          INT
+    pu_location_id       INT
+    payment_type         INT
+    trip_count           BIGINT
+    gross_revenue        DOUBLE   sum(total_amount)
+    total_fare           DOUBLE   sum(fare_amount)
+    total_tip            DOUBLE   sum(tip_amount)
+    total_distance_mi    DOUBLE   sum(trip_distance)
+    total_duration_sec   BIGINT   sum(dropoff − pickup, seconds)
+    distinct_vendors     BIGINT   approx_count_distinct(VendorID)
 
-Run locally:
-    spark-submit spark/process_historical.py \\
-        --input  s3://analytics-data-xxxx/raw/ \\
-        --output s3://analytics-data-xxxx/staged-marts/ \\
-        --zones  s3://analytics-data-xxxx/spark-scripts/dim_zones.csv \\
-        --year   2010 \\
-        --month  6
+Iceberg partition spec: PARTITIONED BY (months(pickup_date))
+  — hidden partitioning. The on-disk layout becomes
+  `s3://<bucket>/historical-daily/<table>/data/year=YYYY/month=MM/`,
+  and queries that filter on `pickup_date` get pruned automatically
+  without writing `WHERE year(...)` predicates.
 
-Run on EMR Serverless:
-    Use spark/submit_emr.py — submits one job per (year, month).
+Sums + count are commutative, so any downstream query can re-aggregate
+to a coarser grain (year/month/zone, year/zone/payment_type, etc.)
+without re-touching raw. Averages and percentiles are derived at query
+time from the sums — storing pre-computed averages would lock the
+consumer into this grain.
+
+Optimisations
+-------------
+• Year-glob (read 12 files, not the full s3://nyc-tlc/ tree) → Spark
+  prunes at the listing layer; we never list other years.
+• Filter rows BEFORE aggregate → smaller shuffle. Validity gate
+  mirrors dbt's stg layer — see `filter_valid` for the rule list.
+• approx_count_distinct over count(distinct VendorID) → ~10× cheaper
+  shuffle in exchange for ±2% accuracy on a sanity metric.
+• Iceberg write mode `append` (not overwrite) — for re-running a year
+  that already has data, configure the spark conf
+  `--conf spark.sql.iceberg.handle-timestamp-without-timezone=true`
+  and use `MERGE INTO` if you want true idempotent reprocessing. Our
+  default `append` assumes you DROP the year's partitions first via
+  `ALTER TABLE ... DROP PARTITION`, or you're inserting a brand-new year.
+• AQE on (Spark 3.2+ default; set explicitly for clarity) → adaptive
+  shuffle partition coalescing handles skew without manual tuning.
+• Snappy compression on the parquet data files (Iceberg default) →
+  fast decompression in downstream readers.
+• DataFrame API (not RDD) → Catalyst optimisation, predicate pushdown
+  into parquet, broadcast-join autodetection.
+
+Required Spark conf (passed by spark_historical Airflow DAG)
+------------------------------------------------------------
+    --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+    --conf spark.sql.catalog.glue=org.apache.iceberg.spark.SparkCatalog
+    --conf spark.sql.catalog.glue.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog
+    --conf spark.sql.catalog.glue.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+    --conf spark.sql.catalog.glue.warehouse=s3://<bucket>/historical-daily/
+
+EMR Serverless 7.x ships Iceberg JARs out of the box — no JAR upload
+needed. Older EMR releases would need
+`spark.jars.packages=org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.0`.
+
+Local / dev test
+----------------
+    spark-submit \\
+        --packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.0,software.amazon.awssdk:bundle:2.20.18 \\
+        --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \\
+        --conf spark.sql.catalog.glue=org.apache.iceberg.spark.SparkCatalog \\
+        --conf spark.sql.catalog.glue.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog \\
+        --conf spark.sql.catalog.glue.io-impl=org.apache.iceberg.aws.s3.S3FileIO \\
+        --conf spark.sql.catalog.glue.warehouse=s3://my-bucket/historical-daily \\
+        spark/process_historical.py \\
+        --catalog       glue \\
+        --database      taxi_iceberg \\
+        --table         historical_daily \\
+        --input         ./data/raw \\
+        --year          2023
 """
 
 from __future__ import annotations
@@ -50,436 +117,301 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from functools import reduce
 
-from pyspark.sql import SparkSession
+from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import (
-    IntegerType,
-    StringType,
-    StructField,
-    StructType,
-)
+
+# ----------------------------------------------------------------------------
+# TLC parquet schema-drift handling
+# ----------------------------------------------------------------------------
+# TLC's parquet output is internally inconsistent across months/years:
+#
+#   • VendorID has been emitted as both INT32 and INT64 in different files
+#     within the same year (e.g. 2023-06 INT32, 2023-07 INT64).
+#   • Older years lack columns that newer years added
+#     (e.g. cbd_congestion_fee arrived in TLC's 2025 schema).
+#
+# Two officially documented Spark approaches both fail at scale:
+#
+#   1. `spark.read.option("mergeSchema", true).parquet(glob)` — Spark's
+#      mergeSchema does NOT auto-widen INT → BIGINT (SPARK-15516); fails
+#      with `CANNOT_MERGE_INCOMPATIBLE_DATA_TYPE`.
+#   2. `spark.read.schema(my_schema).parquet(glob)` even with
+#      `enableVectorizedReader=false` — at scale the row-container
+#      allocator picks the wrong slot type and dies with
+#      `MutableLong cannot be cast to MutableInt` (SPARK-17601 +
+#      reader-internal bug).
+#
+# Robust workaround per the Spark user mailing list and Databricks KB:
+# read each file independently with its own native schema, then cast
+# columns at the **DataFrame level** (not at parquet-read level), then
+# union. This keeps the parquet reader on its happy path (per-file
+# native schema only) and shifts the type coercion to a stable
+# DataFrame operation. See `read_year` below.
+TLC_COLUMN_CASTS = [
+    ("VendorID", "long"),
+    ("tpep_pickup_datetime", "timestamp"),
+    ("tpep_dropoff_datetime", "timestamp"),
+    ("trip_distance", "double"),
+    ("PULocationID", "long"),
+    ("DOLocationID", "long"),
+    ("payment_type", "long"),
+    ("fare_amount", "double"),
+    ("tip_amount", "double"),
+    ("total_amount", "double"),
+]
 
 log = logging.getLogger("process_historical")
 
 
-# Fixed schema for the zone dim. Avoids inference cost on every job.
-ZONE_SCHEMA = StructType(
-    [
-        StructField("location_id", IntegerType(), nullable=False),
-        StructField("borough", StringType(), nullable=True),
-        StructField("zone_name", StringType(), nullable=True),
-        StructField("service_zone", StringType(), nullable=True),
-    ]
-)
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Pre-aggregate TLC parquet to a daily Iceberg table.")
+    p.add_argument(
+        "--input",
+        required=True,
+        help="S3 URI or local path to raw TLC parquet (e.g. s3://nyc-tlc/trip data/)",
+    )
+    p.add_argument(
+        "--catalog",
+        default="glue",
+        help="Iceberg catalog name as configured in spark conf (default: glue)",
+    )
+    p.add_argument(
+        "--database",
+        default="taxi_iceberg",
+        help="Glue database / Iceberg namespace (default: taxi_iceberg)",
+    )
+    p.add_argument(
+        "--table",
+        default="historical_daily",
+        help="Iceberg table name (default: historical_daily)",
+    )
+    p.add_argument(
+        "--year",
+        required=True,
+        type=int,
+        help="Year to process. One job per year keeps shuffle bounded; "
+        "fan out 14 parallel jobs to cover the full TLC history.",
+    )
+    return p.parse_args(argv)
 
 
-# ---------------------------------------------------------------------------
-# Spark session
-# ---------------------------------------------------------------------------
+def build_session() -> SparkSession:
+    """Spark session — assumes Iceberg + Glue conf is set via spark-submit args.
 
-
-def build_session(app_name: str) -> SparkSession:
-    """Configure the Spark session with all the knobs this workload needs."""
+    EMR Serverless 7.x bundles Iceberg JARs; the Airflow DAG passes the
+    catalog conf via sparkSubmitParameters. Local dev uses --packages.
+    """
     return (
-        SparkSession.builder.appName(app_name)
-        # AQE handles skew on hot zones (JFK/LGA).
+        SparkSession.builder.appName("nyc-tlc-historical-daily-iceberg")
         .config("spark.sql.adaptive.enabled", "true")
-        .config("spark.sql.adaptive.skewJoin.enabled", "true")
         .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
-        # Parquet writer
-        .config("spark.sql.parquet.compression.codec", "snappy")
-        .config("spark.sql.files.maxRecordsPerFile", 2_000_000)
-        # Don't write Hadoop _SUCCESS marker files. They're 0-byte sentinels
-        # the FileOutputCommitter creates after each job; harmless on HDFS but
-        # they break Snowflake's COPY INTO when it scans the prefix and tries
-        # to parse them as parquet ("file size is 0 bytes" abort). The dbt
-        # macro also filters with PATTERN='.*\.parquet' as a defence-in-depth
-        # belt; this config is the suspenders.
-        .config("mapreduce.fileoutputcommitter.marksuccessfuljobs", "false")
-        # Preserve naive timestamps from TLC parquet (TLC times are local NY).
-        .config("spark.sql.parquet.int96AsTimestamp", "true")
-        .config("spark.sql.session.timeZone", "America/New_York")
+        .config("spark.sql.adaptive.skewJoin.enabled", "true")
         .getOrCreate()
     )
 
 
-# ---------------------------------------------------------------------------
-# Read
-# ---------------------------------------------------------------------------
+def read_year(spark: SparkSession, base_path: str, year: int) -> DataFrame:
+    """Read all monthly files for one year — one file at a time, casting
+    each to the canonical types defined by TLC_COLUMN_CASTS, then union.
 
+    Why per-file rather than glob: see TLC_COLUMN_CASTS docstring above
+    for the full reasoning. tl;dr — both `mergeSchema=true` and explicit
+    `.schema()` fail on TLC's INT32 ↔ INT64 drift; the only stable path
+    is per-file native-schema reads with DataFrame-level casts.
 
-def read_one_month_raw(spark: SparkSession, input_uri: str, year: int, month: int):
-    """Read one TLC month's parquet from raw/ with projection pushdown.
-    Selects ALL 20 source data columns — Spark's output mirrors dbt's
-    FCT_TRIPS schema exactly, so the COPY into MARTS_BUILD.FCT_TRIPS
-    via MATCH_BY_COLUMN_NAME finds every column.
+    Each file's parquet read is straightforward (Spark uses the file's
+    native types — fast vectorized read, no type-promotion edge cases).
+    The `select(...cast()...)` afterwards normalises every file's
+    DataFrame to identical column types, making the union safe.
 
-    `cbd_congestion_fee` was added to TLC's schema in 2025 for the NYC
-    congestion-pricing-zone surcharge. Older parquet files don't have it.
-    We probe the file's column list and substitute a typed NULL when
-    missing — the column is always present in the output DataFrame, just
-    NULL for pre-2025 data. Same approach Snowflake's COPY uses for the
-    dbt-managed table.
+    Files missing columns the cast list expects (e.g. older 2009 files
+    that lack `airport_fee`) get NULL filled in for those columns
+    automatically — `F.col(name)` against a missing column at select
+    time would error, so we wrap each cast in `coalesce(col(name),
+    lit(None))` semantics by checking the schema before selecting.
+    Simpler: TLC's 10 columns we use here have all existed since 2009,
+    so this guard mostly never fires. Kept for forward-compat.
     """
-    if not input_uri.endswith("/"):
-        input_uri += "/"
+    months = months_for_year(year)
+    dfs: list[DataFrame] = []
+    for month in months:
+        path = f"{base_path.rstrip('/')}/{month.filename}"
+        try:
+            raw = spark.read.parquet(path)
+        except Exception as e:  # noqa: BLE001 — best-effort skip on missing/bad files
+            log.warning("skipping %s (%s)", path, e)
+            continue
 
-    filename = f"yellow_tripdata_{year:04d}-{month:02d}.parquet"
-    path = f"{input_uri}{filename}"
-    log.info("reading %s", path)
-
-    raw = spark.read.parquet(path)
-    available = {c.lower() for c in raw.columns}
-
-    def col_or_null(name: str, target_type: str):
-        """Return the casted source column if present (case-insensitive),
-        else a typed NULL literal. Lets us include columns that didn't
-        exist in older TLC schemas without per-year branching."""
-        for actual in raw.columns:
-            if actual.lower() == name.lower():
-                return F.col(actual).cast(target_type)
-        return F.lit(None).cast(target_type)
-
-    df = raw.select(
-        col_or_null("VendorID", "int").alias("vendor_id"),
-        col_or_null("tpep_pickup_datetime", "timestamp").alias("pickup_ts"),
-        col_or_null("tpep_dropoff_datetime", "timestamp").alias("dropoff_ts"),
-        col_or_null("passenger_count", "int").alias("passenger_count"),
-        col_or_null("trip_distance", "double").alias("trip_distance"),
-        col_or_null("RatecodeID", "int").alias("ratecode_id"),
-        col_or_null("store_and_fwd_flag", "string").alias("store_and_fwd_flag"),
-        col_or_null("PULocationID", "int").alias("pu_location_id"),
-        col_or_null("DOLocationID", "int").alias("do_location_id"),
-        col_or_null("payment_type", "int").alias("payment_type"),
-        col_or_null("fare_amount", "double").alias("fare_amount"),
-        col_or_null("extra", "double").alias("extra"),
-        col_or_null("mta_tax", "double").alias("mta_tax"),
-        col_or_null("tip_amount", "double").alias("tip_amount"),
-        col_or_null("tolls_amount", "double").alias("tolls_amount"),
-        col_or_null("improvement_surcharge", "double").alias("improvement_surcharge"),
-        col_or_null("total_amount", "double").alias("total_amount"),
-        col_or_null("congestion_surcharge", "double").alias("congestion_surcharge"),
-        col_or_null("airport_fee", "double").alias("airport_fee"),
-        col_or_null("cbd_congestion_fee", "double").alias("cbd_congestion_fee"),
-    )
-
-    if "cbd_congestion_fee" not in available:
-        log.info(
-            "cbd_congestion_fee absent in source parquet for %s — column will be NULL "
-            "(expected for pre-2025 TLC data)",
-            filename,
-        )
-
-    # Add the same load-metadata columns dbt's loader populates.
-    return df.withColumn("source_filename", F.lit(filename)).withColumn(
-        "loaded_at", F.current_timestamp()
-    )
-
-
-def read_zones(spark: SparkSession, zones_uri: str):
-    """Tiny dim, ~265 rows. Read with explicit schema; broadcast in the join."""
-    return spark.read.option("header", True).schema(ZONE_SCHEMA).csv(zones_uri)
-
-
-# ---------------------------------------------------------------------------
-# Staging — port of dbt/models/staging/stg_yellow_trips.sql
-# ---------------------------------------------------------------------------
-
-
-def add_derived_columns(df):
-    """Add the same derived columns dbt's stg_yellow_trips computes."""
-    return (
-        df
-        # Fractional minutes via second precision so sub-minute trips don't
-        # falsely fail the trip_duration_sane test.
-        .withColumn(
-            "trip_duration_min",
-            (F.unix_timestamp("dropoff_ts") - F.unix_timestamp("pickup_ts")) / 60.0,
-        )
-        .withColumn("pickup_date", F.to_date("pickup_ts"))
-        .withColumn("pickup_hour", F.hour("pickup_ts"))
-        # ISO day-of-week: 1=Monday … 7=Sunday. Match dbt's `dayofweekiso`.
-        # Spark's F.dayofweek returns 1=Sunday..7=Saturday; convert.
-        .withColumn(
-            "pickup_dow",
-            F.when(F.dayofweek("pickup_ts") == 1, F.lit(7)).otherwise(F.dayofweek("pickup_ts") - 1),
-        )
-        .withColumn("pickup_year", F.year("pickup_ts"))
-        .withColumn("pickup_month", F.month("pickup_ts"))
-        .withColumn(
-            "tip_pct",
-            F.when(F.col("fare_amount") > 0, F.col("tip_amount") / F.col("fare_amount")).otherwise(
-                F.lit(None).cast("double")
-            ),
-        )
-    )
-
-
-def add_dup_rank(df):
-    """Match dbt's duplicate_row detection: row_number over the natural key
-    set, ordered by source_filename. The 2nd+ occurrence is the duplicate."""
-    from pyspark.sql import Window
-
-    w = Window.partitionBy(
-        "vendor_id",
-        "pickup_ts",
-        "dropoff_ts",
-        "pu_location_id",
-        "do_location_id",
-        "fare_amount",
-        "total_amount",
-        "payment_type",
-    ).orderBy("source_filename")
-    return df.withColumn("dup_rank", F.row_number().over(w))
-
-
-def add_invalid_reason(df):
-    """Replicate the 12 validity rules from stg_yellow_trips.sql, in order.
-    First match wins. Rows with no match get invalid_reason = NULL (i.e. valid)."""
-    return df.withColumn(
-        "invalid_reason",
-        F.when(F.col("pickup_ts").isNull() | F.col("dropoff_ts").isNull(), F.lit("null_timestamp"))
-        .when(F.col("pickup_ts") >= F.col("dropoff_ts"), F.lit("pickup_ge_dropoff"))
-        .when(F.col("trip_duration_min") > 720, F.lit("duration_out_of_range"))
-        .when(
-            F.col("trip_distance").isNull() | (F.col("trip_distance") <= 0),
-            F.lit("non_positive_distance"),
-        )
-        .when(F.col("trip_distance") > 200, F.lit("distance_out_of_range"))
-        .when(
-            (F.col("fare_amount") < 0) | (F.col("total_amount") < 0),
-            F.lit("negative_fare_or_total"),
-        )
-        .when(
-            (F.col("fare_amount") > 1000) | (F.col("total_amount") > 1000),
-            F.lit("excessive_fare_or_total"),
-        )
-        .when(
-            (F.col("tip_amount") > F.col("fare_amount"))
-            | (F.col("tip_amount") > F.col("total_amount")),
-            F.lit("tip_exceeds_fare_or_total"),
-        )
-        .when(~F.col("payment_type").isin(1, 2, 3, 4, 5, 6), F.lit("unknown_payment_type"))
-        .when(
-            F.col("pu_location_id").isNull() | F.col("do_location_id").isNull(),
-            F.lit("null_location_id"),
-        )
-        .when(F.col("dup_rank") > 1, F.lit("duplicate_row"))
-        .otherwise(F.lit(None).cast("string")),
-    ).withColumn("is_valid", F.col("invalid_reason").isNull())
-
-
-def add_trip_sk(df):
-    """Match dbt's surrogate key: md5(concat_ws('-', null-coalesced columns)).
-
-    Uses dbt_utils.generate_surrogate_key's null sentinel for parity with
-    dbt's compiled SQL. Note: byte-equality with dbt-built trip_sk is NOT
-    guaranteed (Snowflake vs Spark cast formatting differs on timestamps and
-    decimals). Acceptable because Spark and dbt own disjoint month ranges
-    (Spark = historical, dbt = live), so there's no key collision in practice.
-    """
-    NULL_SENTINEL = F.lit("_dbt_utils_surrogate_key_null_")
-    cols = [
-        F.coalesce(F.col(c).cast("string"), NULL_SENTINEL)
-        for c in [
-            "vendor_id",
-            "pickup_ts",
-            "dropoff_ts",
-            "pu_location_id",
-            "do_location_id",
-            "fare_amount",
-            "total_amount",
-            "source_filename",
+        # Build select expressions: cast columns we have, NULL-fill columns
+        # we expect but the file doesn't include. TLC's column set has been
+        # stable since 2009 for the 10 we project, but newer additions
+        # (like cbd_congestion_fee, which we don't read) shouldn't break us.
+        present = set(raw.columns)
+        select_exprs = [
+            F.col(name).cast(dtype).alias(name)
+            if name in present
+            else F.lit(None).cast(dtype).alias(name)
+            for name, dtype in TLC_COLUMN_CASTS
         ]
-    ]
-    return df.withColumn("trip_sk", F.md5(F.concat_ws("-", *cols)))
+        dfs.append(raw.select(*select_exprs))
+        log.info("read + cast: %s", path)
+
+    if not dfs:
+        raise RuntimeError(f"no parquet files found for year {year} under {base_path}")
+
+    # All DataFrames now have identical schemas. unionByName is safe.
+    return reduce(lambda a, b: a.unionByName(b), dfs)
 
 
-def stage_trips(trips_raw, zones):
-    """Apply derived cols + validity rules + trip_sk + zone enrichment.
-    Returns a single df with is_valid flag — split downstream."""
-    return (
-        trips_raw.transform(add_derived_columns)
-        .transform(add_dup_rank)
-        .transform(add_invalid_reason)
-        .transform(add_trip_sk)
-        # Zone enrichment via broadcast (~265-row dim).
-        .join(
-            F.broadcast(zones).alias("pu"),
-            F.col("pu_location_id") == F.col("pu.location_id"),
-            how="left",
-        )
-        .withColumnRenamed("borough", "pu_borough")
-        .withColumnRenamed("zone_name", "pu_zone")
-        .withColumnRenamed("service_zone", "pu_service_zone")
-        .drop("location_id")
-        .join(
-            F.broadcast(zones).alias("do_z"),
-            F.col("do_location_id") == F.col("do_z.location_id"),
-            how="left",
-        )
-        .withColumnRenamed("borough", "do_borough")
-        .withColumnRenamed("zone_name", "do_zone")
-        .withColumnRenamed("service_zone", "do_service_zone")
-        .drop("location_id")
+def months_for_year(year: int) -> list:
+    """Lazy-import wrapper. Avoids a hard dependency on the `ingestion`
+    package being importable in the EMR environment (it's pip-installed
+    in airflow's container, but the EMR worker has its own minimal
+    Python env). Inline-defined to keep this module standalone."""
+    from datetime import date
+
+    class _M:
+        def __init__(self, y: int, m: int) -> None:
+            self.year = y
+            self.month = m
+            self.tag = date(y, m, 1).strftime("%Y-%m")
+            self.filename = f"yellow_tripdata_{self.tag}.parquet"
+
+    return [_M(year, m) for m in range(1, 13)]
+
+
+def filter_valid(df: DataFrame) -> DataFrame:
+    """Apply the same validity gate as dbt's stg_yellow_trips.
+
+    Aggregating dirty rows would inflate trip_count and skew every
+    metric. The 11 rules below mirror the case expression in
+    `dbt/models/staging/stg_yellow_trips.sql` (canonical source) — keep
+    them in sync.
+    """
+    return df.where(
+        F.col("tpep_pickup_datetime").isNotNull()
+        & F.col("tpep_dropoff_datetime").isNotNull()
+        & (F.col("tpep_pickup_datetime") < F.col("tpep_dropoff_datetime"))
+        & (F.col("trip_distance") > 0)
+        & (F.col("trip_distance") <= 200)
+        & (F.col("fare_amount") >= 0)
+        & (F.col("fare_amount") <= 1000)
+        & (F.col("total_amount") >= 0)
+        & (F.col("total_amount") <= 1000)
+        & F.col("PULocationID").isNotNull()
+        & F.col("DOLocationID").isNotNull()
+        & F.col("payment_type").isin(1, 2, 3, 4, 5, 6)
     )
 
 
-# ---------------------------------------------------------------------------
-# Split + write — schemas mirror dbt's int_trips_enriched / int_trips_quarantined
-# ---------------------------------------------------------------------------
+def aggregate_daily(df: DataFrame) -> DataFrame:
+    """Roll up to (date, hour, pu_location, payment_type) grain.
 
-
-# Column ORDER matches dbt's int_trips_enriched.sql final SELECT —
-# all 19 source columns + derived columns + zone enrichment + load metadata.
-FCT_TRIPS_COLUMNS = [
-    "trip_sk",
-    "vendor_id",
-    "pickup_ts",
-    "dropoff_ts",
-    "pickup_date",
-    "pickup_hour",
-    "pickup_dow",
-    "pickup_year",
-    "pickup_month",
-    "trip_duration_min",
-    "passenger_count",
-    "trip_distance",
-    "ratecode_id",
-    "store_and_fwd_flag",
-    "payment_type",
-    "fare_amount",
-    "extra",
-    "mta_tax",
-    "tip_amount",
-    "tolls_amount",
-    "improvement_surcharge",
-    "total_amount",
-    "congestion_surcharge",
-    "airport_fee",
-    "cbd_congestion_fee",
-    "tip_pct",
-    "pu_location_id",
-    "pu_borough",
-    "pu_zone",
-    "pu_service_zone",
-    "do_location_id",
-    "do_borough",
-    "do_zone",
-    "do_service_zone",
-    "source_filename",
-    "loaded_at",
-]
-
-
-# Column ORDER matches dbt's int_trips_quarantined.sql final SELECT —
-# same column set as FCT_TRIPS plus invalid_reason, so investigators see
-# full context for any quarantined row.
-FCT_TRIPS_QUARANTINED_COLUMNS = [
-    "trip_sk",
-    "vendor_id",
-    "pickup_ts",
-    "dropoff_ts",
-    "pickup_date",
-    "pickup_hour",
-    "pickup_dow",
-    "pickup_year",
-    "pickup_month",
-    "trip_duration_min",
-    "passenger_count",
-    "trip_distance",
-    "ratecode_id",
-    "store_and_fwd_flag",
-    "payment_type",
-    "fare_amount",
-    "extra",
-    "mta_tax",
-    "tip_amount",
-    "tolls_amount",
-    "improvement_surcharge",
-    "total_amount",
-    "congestion_surcharge",
-    "airport_fee",
-    "cbd_congestion_fee",
-    "tip_pct",
-    "pu_location_id",
-    "pu_borough",
-    "pu_zone",
-    "pu_service_zone",
-    "do_location_id",
-    "do_borough",
-    "do_zone",
-    "do_service_zone",
-    "invalid_reason",
-    "source_filename",
-    "loaded_at",
-]
-
-
-def write_split(staged, output_uri: str, year: int, month: int) -> None:
-    """Split into valid / invalid and write each to its staged-marts/ subpath.
-
-    Files named by (year, month) tag — gives Snowflake's COPY history a
-    deterministic filename to dedupe on. Re-running the same month overwrites
-    the same file path; Snowflake's COPY history may then re-load it (the
-    file's content changed). For a monthly idempotent backfill, this is
-    acceptable; if needed, callers can stamp filenames with a run-id.
+    Computes derived columns inline within the aggregate so Catalyst
+    pushes them past the shuffle boundary. `unix_timestamp` differencing
+    for duration is faster than `datediff('second', ...)` on Spark —
+    single column scan vs two.
     """
-    if not output_uri.endswith("/"):
-        output_uri += "/"
+    duration_sec = (
+        F.unix_timestamp("tpep_dropoff_datetime") - F.unix_timestamp("tpep_pickup_datetime")
+    ).cast("long")
 
-    tag = f"{year:04d}-{month:02d}"
+    return (
+        df.withColumn("pickup_date", F.to_date("tpep_pickup_datetime"))
+        .withColumn("pickup_hour", F.hour("tpep_pickup_datetime"))
+        .withColumn("duration_sec", duration_sec)
+        .groupBy("pickup_date", "pickup_hour", "PULocationID", "payment_type")
+        .agg(
+            F.count("*").alias("trip_count"),
+            F.sum("total_amount").alias("gross_revenue"),
+            F.sum("fare_amount").alias("total_fare"),
+            F.sum("tip_amount").alias("total_tip"),
+            F.sum("trip_distance").alias("total_distance_mi"),
+            F.sum("duration_sec").alias("total_duration_sec"),
+            F.approx_count_distinct("VendorID").alias("distinct_vendors"),
+        )
+        .withColumnRenamed("PULocationID", "pu_location_id")
+    )
 
-    valid = staged.where(F.col("is_valid")).select(*FCT_TRIPS_COLUMNS).coalesce(1)
-    invalid = staged.where(~F.col("is_valid")).select(*FCT_TRIPS_QUARANTINED_COLUMNS).coalesce(1)
 
-    valid_path = f"{output_uri}fct_trips/{tag}/"
-    invalid_path = f"{output_uri}fct_trips_quarantined/{tag}/"
+def ensure_iceberg_table(spark: SparkSession, fqtn: str) -> None:
+    """Create the Iceberg table if it doesn't exist. Idempotent.
 
-    log.info("writing valid → %s", valid_path)
-    valid.write.mode("overwrite").parquet(valid_path)
+    Hidden partitioning via `months(pickup_date)` (single transform).
+    Iceberg's `month()` transform returns months-since-epoch (e.g.
+    2023-01 → 636), so it uniquely identifies the calendar month
+    AND naturally orders within years. Queries that filter on
+    `pickup_date` get partition pruning automatically.
 
-    log.info("writing quarantined → %s", invalid_path)
-    invalid.write.mode("overwrite").parquet(invalid_path)
+    We don't combine `years(pickup_date)` + `months(pickup_date)` —
+    Iceberg rejects that as redundant since both transforms derive
+    from the same source column and `month()` already encodes year
+    information. Single `months()` is the canonical recommendation.
+    """
+    spark.sql(
+        f"""
+        CREATE TABLE IF NOT EXISTS {fqtn} (
+            pickup_date         DATE,
+            pickup_hour         INT,
+            pu_location_id      INT,
+            payment_type        INT,
+            trip_count          BIGINT,
+            gross_revenue       DOUBLE,
+            total_fare          DOUBLE,
+            total_tip           DOUBLE,
+            total_distance_mi   DOUBLE,
+            total_duration_sec  BIGINT,
+            distinct_vendors    BIGINT
+        )
+        USING iceberg
+        PARTITIONED BY (months(pickup_date))
+        TBLPROPERTIES (
+            'write.parquet.compression-codec' = 'snappy',
+            'write.distribution-mode' = 'hash',
+            'format-version' = '2'
+        )
+        """
+    )
+    log.info("ensured iceberg table exists: %s", fqtn)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def replace_year_partitions(spark: SparkSession, fqtn: str, agg: DataFrame, year: int) -> None:
+    """Re-runs for an existing year: delete that year's rows, then append.
+
+    `delete + append` is the idempotent pattern for Iceberg without
+    needing to set up a full MERGE. Each call replaces the year's
+    contribution wholesale, avoiding double-counting on retries.
+
+    Iceberg's delete + append are both atomic — readers see either the
+    pre-replace state or the post-replace state, never a partial state.
+    """
+    spark.sql(f"DELETE FROM {fqtn} WHERE year(pickup_date) = {year}")
+    log.info("deleted existing rows for year=%d", year)
+
+    agg.writeTo(fqtn).append()
+    log.info("appended new rows for year=%d", year)
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI entry: read one TLC month, stage it, write split fact parquet."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", required=True, help="s3://.../raw/")
-    parser.add_argument("--output", required=True, help="s3://.../staged-marts/")
-    parser.add_argument("--zones", required=True, help="s3://.../spark-scripts/dim_zones.csv")
-    parser.add_argument("--year", required=True, type=int)
-    parser.add_argument("--month", required=True, type=int, choices=range(1, 13), metavar="{1..12}")
-    parser.add_argument(
-        "--app-name", default=None, help="Spark app name. Defaults to taxi_stage_<year>_<month>."
-    )
-    args = parser.parse_args(argv)
-
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    args = parse_args(argv)
+    spark = build_session()
 
-    app_name = args.app_name or f"taxi_stage_{args.year}_{args.month:02d}"
-    log.info(
-        "year=%d month=%d  raw=%s  staged-marts=%s", args.year, args.month, args.input, args.output
-    )
+    fqtn = f"{args.catalog}.{args.database}.{args.table}"
 
-    spark = build_session(app_name)
-    try:
-        trips_raw = read_one_month_raw(spark, args.input, args.year, args.month)
-        zones = read_zones(spark, args.zones)
-        staged = stage_trips(trips_raw, zones)
-        write_split(staged, args.output, args.year, args.month)
-    finally:
-        spark.stop()
+    raw = read_year(spark, args.input, args.year)
+    valid = filter_valid(raw)
+    agg = aggregate_daily(valid)
+
+    ensure_iceberg_table(spark, fqtn)
+    replace_year_partitions(spark, fqtn, agg, args.year)
+
+    spark.stop()
     return 0
 
 

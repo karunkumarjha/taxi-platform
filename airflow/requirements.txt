@@ -1,12 +1,15 @@
-# Astro Runtime ships with Airflow + common providers pre-installed.
+# Astro Runtime 3.0-14 ships Apache Airflow 3.0.6 pre-installed.
 # We add: Snowflake provider, dbt + adapter, AWS SDK, HTTP client, retry helper.
 #
 # All deps pinned EXACTLY — loose ranges trigger pip backtracking hell on
 # dbt-adapters resolution (every dbt-snowflake patch combinatorially explodes
 # against every dbt-adapters version). Lockstep upgrade in one PR if needed.
 
-apache-airflow-providers-snowflake==5.8.0
-apache-airflow-providers-amazon==9.1.0
+# Provider versions compatible with Airflow 3.x. snowflake 6.x and amazon
+# 9.5+ are the first lines that declare 3.x compatibility (older ones target
+# 2.10 max).
+apache-airflow-providers-snowflake==6.12.2
+apache-airflow-providers-amazon==9.27.0
 
 # typer 0.18+ removed the [all] extra. dbt's deps still request typer[all],
 # which sends pip into multi-minute backtracking through every typer/dbt-*
@@ -14,14 +17,16 @@ apache-airflow-providers-amazon==9.1.0
 # the resolver dead.
 typer==0.12.5
 
-# Astro Runtime 12.1.1 ships opentelemetry-proto 1.27.0 which pins
-# protobuf<5. dbt 1.8+ requires protobuf>=5 (and 1.9+ requires protobuf>=6).
-# Pinning dbt to 1.7.x stays compatible. All features we use (constraints,
-# custom tests, sources/freshness, dbt_utils, dbt_expectations) work in 1.7.
-dbt-core==1.7.18
-dbt-snowflake==1.7.5
+# Astro Runtime 3.0-14 ships dbt-semantic-interfaces>0.6 transitively, which
+# conflicts with dbt 1.8's pin (`>=0.5.1,<0.6`). dbt 1.9 uses the newer
+# interfaces and resolves cleanly. All features we use (constraints,
+# custom tests, snapshots with strategy='check', sources/freshness,
+# dbt_utils, dbt_expectations, Iceberg materialisation if needed later)
+# work in 1.9.
+dbt-core==1.9.10
+dbt-snowflake==1.9.4
 
-boto3==1.40.62
+boto3==1.41.0
 requests==2.32.5
 tenacity==9.1.4
 snowflake-connector-python==3.18.0

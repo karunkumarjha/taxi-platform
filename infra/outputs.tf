@@ -21,6 +21,41 @@ output "snowflake_raw_schema" {
   value = snowflake_schema.raw.name
 }
 
+output "snowflake_snapshots_schema" {
+  description = "Schema where dbt snapshots (Silver SCD layer) live"
+  value       = snowflake_schema.snapshots.name
+}
+
+output "snowflake_marts_schema" {
+  description = "Production analytics schema (read by ANALYST + BI tools)"
+  value       = snowflake_schema.marts.name
+}
+
+output "snowflake_marts_build_schema" {
+  description = "Build-side schema for the blue-green dbt swap"
+  value       = snowflake_schema.marts_build.name
+}
+
+output "snowflake_historical_schema" {
+  description = "Schema holding the Iceberg HISTORICAL_DAILY_AGG table (read by ANALYST)"
+  value       = snowflake_schema.historical.name
+}
+
+output "snowflake_external_volume" {
+  description = "EXTERNAL VOLUME name bound to the Iceberg historical-daily/ S3 prefix"
+  value       = snowflake_external_volume.historical.name
+}
+
+output "snowflake_catalog_integration" {
+  description = "CATALOG INTEGRATION name pointing at the AWS Glue catalog (created via snowflake_execute)"
+  value       = local.glue_catalog_integration_name
+}
+
+output "glue_database_name" {
+  description = "AWS Glue Data Catalog database where Spark registers the Iceberg table"
+  value       = aws_glue_catalog_database.taxi_iceberg.name
+}
+
 output "snowflake_warehouse" {
   value = snowflake_warehouse.wh_xs.name
 }
@@ -45,30 +80,19 @@ output "snowflake_external_id" {
   sensitive   = false
 }
 
-# --- Phase 2 outputs ---------------------------------------------------------
-
-output "s3_staged_marts_uri" {
-  description = "s3:// URI where Spark stages FCT_TRIPS / FCT_TRIPS_QUARANTINED parquet for dbt to COPY"
-  value       = "s3://${aws_s3_bucket.data.bucket}/staged-marts/"
-}
-
-output "s3_spark_scripts_uri" {
-  value = "s3://${aws_s3_bucket.data.bucket}/spark-scripts/"
-}
-
-output "s3_spark_logs_uri" {
-  value = "s3://${aws_s3_bucket.data.bucket}/spark-logs/"
-}
+# --- EMR Serverless outputs --------------------------------------------------
+# Used by the spark_historical Airflow DAG to start_job_run().
 
 output "emr_application_id" {
-  description = "EMR Serverless application ID (pass to start_job_run)"
+  description = "EMR Serverless application ID for spark_historical DAG"
   value       = aws_emrserverless_application.spark.id
 }
 
 output "emr_exec_role_arn" {
-  description = "IAM role EMR Serverless job runs assume"
+  description = "IAM role EMR Serverless assumes when running process_historical.py"
   value       = aws_iam_role.emr_exec.arn
 }
+
 
 # --- RBAC outputs -----------------------------------------------------------
 # Users + their roles. Passwords are sensitive — read with:
@@ -105,9 +129,4 @@ output "snowflake_analyst_role" {
 output "snowflake_analyst_password" {
   value     = random_password.analyst.result
   sensitive = true
-}
-
-output "snowflake_spark_stage" {
-  description = "Fully-qualified Spark stage name for COPY INTO MARTS_BUILD.FCT_TRIPS"
-  value       = "${snowflake_database.analytics.name}.${snowflake_schema.raw.name}.${snowflake_stage.s3_spark_stage.name}"
 }

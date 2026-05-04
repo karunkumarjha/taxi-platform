@@ -15,19 +15,26 @@ clean-targets:
   - target
   - dbt_packages
 
-# Three logical dbt layers, all materialised in the single MARTS_BUILD
-# Snowflake schema (atomically swapped to MARTS on successful build):
-#   staging       → views        (1:1 with RAW; cast + flag invalid rows)
-#   intermediate  → incremental  (FCT_TRIPS, FCT_TRIPS_QUARANTINED)
-#   marts         → incremental  (AGG_*)
+# Three logical dbt layers, all materialised in MARTS_BUILD (atomically
+# swapped to MARTS on successful build):
+#   staging       → views        (read snp_yellow_trips WHERE dbt_valid_to
+#                                  IS NULL; cast + flag invalid rows)
+#   intermediate  → incremental  (FCT_TRIPS — merge on trip_bk;
+#                                  FCT_TRIPS_QUARANTINED — merge on
+#                                  quarantine_key)
+#   marts         → incremental  (AGG_*; delete+insert at the natural
+#                                  grain of each aggregate)
 #
-# Self-healing incremental design: every dbt run discovers what to rebuild
-# from the data itself, not from parameters. Each model's source CTE
-# computes "months whose row count in the source layer diverges from the
-# count reflected in the target" (with a min-row threshold to ignore TLC's
-# tiny cross-month tail-bleed). Detection is data-driven, not date-driven —
-# so a single dbt run handles live monthly ingestion AND historical Spark
-# backfill output AND late-arriving leak-row corrections, identically.
+# Plus a Silver SCD layer outside MARTS_BUILD:
+#   snapshots/    → SCD Type 2   (snp_yellow_trips lives in SNAPSHOTS
+#                                  schema, untouched by the blue-green
+#                                  swap; tracks TLC corrections via
+#                                  strategy='check' on mutable columns)
+#
+# Per-run scoping: `target_year` / `target_month` dbt vars (set by Airflow
+# from logical_date − lag_months) gate the intermediate layer's incremental
+# WHERE filter. One DAG run = one month; re-runs are idempotent (merge
+# upserts existing trip_bks).
 models:
   analytics:
     staging:

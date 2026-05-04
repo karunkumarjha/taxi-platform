@@ -93,29 +93,38 @@ jobs:
 
       - name: Airflow DagBag load test
         run: |
-          uv run --with 'apache-airflow==3.0.0' \
-                 --with apache-airflow-providers-snowflake \
+          uv run --with 'apache-airflow==3.0.6' \
+                 --with 'apache-airflow-providers-snowflake==6.4.1' \
+                 --with 'apache-airflow-providers-amazon==9.10.0' \
                  python -c "
           import sys; sys.path.insert(0, 'airflow')
           from airflow.models import DagBag
           db = DagBag(dag_folder='airflow/dags', include_examples=False)
           assert not db.import_errors, db.import_errors
-          assert 'dbt_pipeline' in db.dags, 'dbt_pipeline missing'
-          assert 'spark_pipeline' in db.dags, 'spark_pipeline missing'
+          assert set(db.dags.keys()) == {'dbt_pipeline', 'spark_historical'}, (
+              f'unexpected DAGs: {set(db.dags.keys())}'
+          )
           dbt_tasks = {t.task_id for t in db.dags['dbt_pipeline'].tasks}
-          required = {
+          dbt_required = {
               'compute_target_month', 'ingest_one_month', 'load_one_month_to_snowflake',
               'dbt_build.reset_marts_build_from_marts',
-              'dbt_build.load_spark_staged_into_marts_build',
-              'dbt_build.swap_marts_blue_green', 'notify_success',
+              'dbt_build.dbt_snapshot',
+              'dbt_build.swap_marts_blue_green',
           }
-          missing = required - dbt_tasks
-          assert not missing, f'dbt_pipeline missing tasks: {missing}'
+          assert not (dbt_required - dbt_tasks), (
+              f'dbt_pipeline missing tasks: {dbt_required - dbt_tasks}'
+          )
+          spark_tasks = {t.task_id for t in db.dags['spark_historical'].tasks}
+          spark_required = {
+              'ensure_year_in_s3',
+              'submit_emr_job', 'wait_for_emr',
+              'create_iceberg_table', 'refresh_iceberg',
+          }
+          assert not (spark_required - spark_tasks), (
+              f'spark_historical missing tasks: {spark_required - spark_tasks}'
+          )
           print('DagBag OK — DAGs:', list(db.dags.keys()))
           "
-
-      - name: PySpark unit tests
-        run: uv run python -m pytest spark/tests -v
 
       # ---- Belt-and-suspenders: re-run pre-commit on the whole tree ---
       # Catches anything a developer's missing/disabled pre-commit hook

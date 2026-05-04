@@ -15,6 +15,7 @@ import argparse
 import logging
 import os
 import sys
+import uuid
 
 import snowflake.connector
 from dotenv import load_dotenv
@@ -49,6 +50,8 @@ CREATE TABLE IF NOT EXISTS {db}.{schema}.{table} (
     cbd_congestion_fee      NUMBER(18, 4),
     -- load metadata
     _source_filename        STRING,
+    _ingest_batch_id        VARCHAR,
+    _loaded_by              VARCHAR,
     _loaded_at              TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()
 )
 COMMENT = 'Landing table for TLC Yellow trip parquet — loaded via COPY INTO from @S3_TLC_STAGE'
@@ -60,7 +63,7 @@ COPY INTO {db}.{schema}.{table} (
     trip_distance, RatecodeID, store_and_fwd_flag, PULocationID, DOLocationID,
     payment_type, fare_amount, extra, mta_tax, tip_amount, tolls_amount,
     improvement_surcharge, total_amount, congestion_surcharge, airport_fee,
-    cbd_congestion_fee, _source_filename
+    cbd_congestion_fee, _source_filename, _ingest_batch_id, _loaded_by
 )
 FROM (
     SELECT
@@ -94,12 +97,15 @@ FROM (
         -- variant keys, so the cast yields NULL automatically. No
         -- conditional logic needed.
         $1:cbd_congestion_fee::NUMBER(18, 4),
-        METADATA$FILENAME
+        METADATA$FILENAME,
+        '{batch_id}',
+        '{loaded_by}'
     FROM @{db}.{schema}.{stage}
 ){files_clause}
 FILE_FORMAT = (FORMAT_NAME = '{db}.{schema}.{file_format}')
 ON_ERROR = 'ABORT_STATEMENT'
 PURGE = FALSE
+FORCE = TRUE
 """
 
 
@@ -124,17 +130,34 @@ def ensure_table(conn, cfg: dict) -> None:
         log.info("ensured table %s.%s.%s", cfg["database"], cfg["schema"], cfg["table"])
 
 
-def copy_from_stage(conn, cfg: dict, *, month: str | None = None) -> list[tuple]:
+def copy_from_stage(
+    conn,
+    cfg: dict,
+    *,
+    month: str | None = None,
+    batch_id: str | None = None,
+    loaded_by: str = "manual",
+) -> list[tuple]:
     """Run COPY INTO from the external stage; returns the per-file result rows.
 
     If `month` (YYYY-MM) is provided, the COPY scopes to a single file
     (`yellow_tripdata_YYYY-MM.parquet`) via Snowflake's `FILES = (...)` clause.
-    Otherwise it loads everything currently on the stage (Snowflake's COPY
-    history skips files already loaded, so this is still idempotent).
+    Otherwise it loads everything currently on the stage.
+
+    FORCE=TRUE ensures each call re-loads the file regardless of Snowflake's
+    COPY history — RAW is append-only (Bronze layer). Audit columns:
+      • _ingest_batch_id — UUID4 per call; identifies the load event.
+      • _loaded_by — caller name (e.g. "dbt_pipeline", "manual") so
+        analysts can attribute each row to its load source.
+
+    `batch_id` defaults to a new UUID4 if not supplied.
+    `loaded_by` defaults to "manual" — the CLI entrypoint.
     """
     # Snowflake interprets FILES paths relative to the stage URL
     # (s3://bucket/raw/), so we pass the bare filename.
     files_clause = f"\nFILES = ('yellow_tripdata_{month}.parquet')" if month else ""
+    if batch_id is None:
+        batch_id = str(uuid.uuid4())
 
     sql = COPY_SQL.format(
         db=cfg["database"],
@@ -143,6 +166,8 @@ def copy_from_stage(conn, cfg: dict, *, month: str | None = None) -> list[tuple]
         stage=cfg["stage"],
         file_format=cfg["file_format"],
         files_clause=files_clause,
+        batch_id=batch_id,
+        loaded_by=loaded_by,
     )
     with conn.cursor() as cur:
         scope = f"month={month}" if month else "all staged files"

@@ -7,10 +7,6 @@ models:
       partitions rows into the "enrichable" set (int_trips_enriched) and the
       "quarantine" set (int_trips_quarantined). No rows are ever dropped.
     columns:
-      - name: trip_sk
-        description: "Synthetic surrogate key (md5 of natural columns)."
-        tests:
-          - not_null
       - name: pickup_ts
         tests:
           - not_null:
@@ -67,5 +63,12 @@ models:
           - trip_duration_sane:
               max_minutes: 720
               row_condition: "is_valid"
+      - name: trip_bk
+        description: >
+          Business key surrogate — md5 of the 5 immutable trip identifiers
+          (vendor_id, pickup_ts, dropoff_ts, pu_location_id, do_location_id).
+          Passed through from snp_yellow_trips. Stable across TLC corrections.
+        tests:
+          - not_null
       - name: is_valid
         description: "Boolean partition key: TRUE rows flow to enriched, FALSE to quarantine."

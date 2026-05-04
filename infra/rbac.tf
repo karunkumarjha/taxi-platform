@@ -5,8 +5,8 @@
 #   LOADER     — only role that writes RAW.YELLOW_TRIPDATA via COPY INTO.
 #   DBT        — owns MARTS_BUILD + MARTS schemas (OWNERSHIP needed because
 #                ALTER SCHEMA ... SWAP WITH ... requires it on both schemas
-#                being swapped). Also performs the COPY of Spark-staged data
-#                via run-operations, and clones MARTS into MARTS_BUILD.
+#                being swapped). Also owns SNAPSHOTS (Silver SCD layer),
+#                clones MARTS into MARTS_BUILD on each run, and reads RAW.
 #   ANALYST    — read-only across the board for ad-hoc debugging and BI.
 #                Any external BI tool (Tableau, Looker, Superset, etc.) plugs
 #                in as this role.
@@ -41,7 +41,7 @@ resource "snowflake_account_role" "loader" {
 
 resource "snowflake_account_role" "dbt" {
   name    = "DBT"
-  comment = "Owns MARTS + MARTS_BUILD; runs dbt builds, COPY of Spark-staged, and the blue-green SWAP."
+  comment = "Owns MARTS + MARTS_BUILD + SNAPSHOTS; runs dbt builds, snapshot, and the blue-green SWAP."
 }
 
 resource "snowflake_account_role" "analyst" {
@@ -112,10 +112,12 @@ resource "snowflake_grant_account_role" "analyst_to_user" {
 # ---- Locals: fully-qualified names (DRY) -----------------------------------
 
 locals {
-  db           = snowflake_database.analytics.name
-  raw_schema   = "${local.db}.${snowflake_schema.raw.name}"
-  build_schema = "${local.db}.${snowflake_schema.marts_build.name}"
-  marts_schema = "${local.db}.${snowflake_schema.marts.name}"
+  db                = snowflake_database.analytics.name
+  raw_schema        = "${local.db}.${snowflake_schema.raw.name}"
+  build_schema      = "${local.db}.${snowflake_schema.marts_build.name}"
+  marts_schema      = "${local.db}.${snowflake_schema.marts.name}"
+  snapshots_schema  = "${local.db}.${snowflake_schema.snapshots.name}"
+  historical_schema = "${local.db}.${snowflake_schema.historical.name}"
 
   all_functional_roles = [
     snowflake_account_role.loader.name,
@@ -189,17 +191,6 @@ resource "snowflake_grant_privileges_to_account_role" "stage_loader" {
   on_schema_object {
     object_type = "STAGE"
     object_name = "${local.raw_schema}.${snowflake_stage.s3_tlc_stage.name}"
-  }
-}
-
-# DBT needs USAGE on the Spark stage (RAW.S3_SPARK_STAGE) so the
-# load_spark_staged_into_marts_build macro can COPY from it.
-resource "snowflake_grant_privileges_to_account_role" "stage_spark_dbt" {
-  account_role_name = snowflake_account_role.dbt.name
-  privileges        = ["USAGE"]
-  on_schema_object {
-    object_type = "STAGE"
-    object_name = "${local.raw_schema}.${snowflake_stage.s3_spark_stage.name}"
   }
 }
 
@@ -363,4 +354,130 @@ resource "snowflake_grant_privileges_to_account_role" "marts_analyst_tables_futu
     }
   }
   depends_on = [snowflake_grant_ownership.marts_to_dbt]
+}
+
+# ---- SNAPSHOTS schema ------------------------------------------------------
+# DBT owns it and writes the SCD snapshot table directly (not via blue-green
+# swap). ANALYST gets SELECT on future tables for audit queries.
+
+resource "snowflake_grant_ownership" "snapshots_to_dbt" {
+  account_role_name = snowflake_account_role.dbt.name
+  on {
+    object_type = "SCHEMA"
+    object_name = local.snapshots_schema
+  }
+  outbound_privileges = "COPY"
+}
+
+resource "snowflake_grant_privileges_to_account_role" "snapshots_dbt_schema" {
+  account_role_name = snowflake_account_role.dbt.name
+  privileges        = ["USAGE", "CREATE TABLE"]
+  on_schema {
+    schema_name = local.snapshots_schema
+  }
+  depends_on = [snowflake_grant_ownership.snapshots_to_dbt]
+}
+
+resource "snowflake_grant_privileges_to_account_role" "snapshots_dbt_tables_future" {
+  account_role_name = snowflake_account_role.dbt.name
+  privileges        = ["INSERT", "UPDATE", "SELECT", "DELETE"]
+  on_schema_object {
+    future {
+      object_type_plural = "TABLES"
+      in_schema          = local.snapshots_schema
+    }
+  }
+  depends_on = [snowflake_grant_ownership.snapshots_to_dbt]
+}
+
+resource "snowflake_grant_privileges_to_account_role" "snapshots_analyst_schema" {
+  account_role_name = snowflake_account_role.analyst.name
+  privileges        = ["USAGE"]
+  on_schema {
+    schema_name = local.snapshots_schema
+  }
+  depends_on = [snowflake_grant_ownership.snapshots_to_dbt]
+}
+
+resource "snowflake_grant_privileges_to_account_role" "snapshots_analyst_tables_future" {
+  account_role_name = snowflake_account_role.analyst.name
+  privileges        = ["SELECT"]
+  on_schema_object {
+    future {
+      object_type_plural = "TABLES"
+      in_schema          = local.snapshots_schema
+    }
+  }
+  depends_on = [snowflake_grant_ownership.snapshots_to_dbt]
+}
+
+# ---- HISTORICAL schema (Iceberg) -------------------------------------------
+# DBT owns it (CREATE ICEBERG TABLE runs as DBT in spark_historical DAG).
+# DBT also needs USAGE on the EXTERNAL VOLUME and CATALOG INTEGRATION at the
+# account level to bind the Iceberg table to them. ANALYST gets SELECT.
+
+resource "snowflake_grant_ownership" "historical_to_dbt" {
+  account_role_name = snowflake_account_role.dbt.name
+  on {
+    object_type = "SCHEMA"
+    object_name = local.historical_schema
+  }
+  outbound_privileges = "COPY"
+}
+
+resource "snowflake_grant_privileges_to_account_role" "historical_dbt_schema" {
+  account_role_name = snowflake_account_role.dbt.name
+  privileges        = ["USAGE", "CREATE ICEBERG TABLE"]
+  on_schema {
+    schema_name = local.historical_schema
+  }
+  depends_on = [snowflake_grant_ownership.historical_to_dbt]
+}
+
+# Account-level USAGE on the EXTERNAL VOLUME — required for any role that
+# binds an Iceberg table to it (CREATE ICEBERG TABLE ... EXTERNAL_VOLUME = ...).
+resource "snowflake_grant_privileges_to_account_role" "external_volume_usage_dbt" {
+  account_role_name = snowflake_account_role.dbt.name
+  privileges        = ["USAGE"]
+  on_account_object {
+    object_type = "EXTERNAL VOLUME"
+    object_name = snowflake_external_volume.historical.name
+  }
+}
+
+# Account-level USAGE on the CATALOG INTEGRATION — same reason.
+resource "snowflake_grant_privileges_to_account_role" "catalog_integration_usage_dbt" {
+  account_role_name = snowflake_account_role.dbt.name
+  privileges        = ["USAGE"]
+  on_account_object {
+    object_type = "INTEGRATION"
+    object_name = local.glue_catalog_integration_name
+  }
+  # The integration itself is created via snowflake_execute, so we depend on
+  # that resource explicitly to ensure ordering.
+  depends_on = [snowflake_execute.glue_catalog_integration]
+}
+
+resource "snowflake_grant_privileges_to_account_role" "historical_analyst_schema" {
+  account_role_name = snowflake_account_role.analyst.name
+  privileges        = ["USAGE"]
+  on_schema {
+    schema_name = local.historical_schema
+  }
+  depends_on = [snowflake_grant_ownership.historical_to_dbt]
+}
+
+# Iceberg tables are ICEBERG TABLES in Snowflake's grant grammar, but
+# `SELECT` on `future ICEBERG TABLES` is the right grant. Plural object
+# type is ICEBERG TABLES.
+resource "snowflake_grant_privileges_to_account_role" "historical_analyst_iceberg_future" {
+  account_role_name = snowflake_account_role.analyst.name
+  privileges        = ["SELECT"]
+  on_schema_object {
+    future {
+      object_type_plural = "ICEBERG TABLES"
+      in_schema          = local.historical_schema
+    }
+  }
+  depends_on = [snowflake_grant_ownership.historical_to_dbt]
 }

@@ -51,15 +51,16 @@ resource "aws_s3_bucket_lifecycle_configuration" "data" {
     }
   }
 
-  # Phase 2: Spark driver/executor logs are verbose and worthless after debugging.
+  # EMR Serverless writes Spark stderr/stdout to spark-logs/. They're
+  # diagnostic-only — auto-clean after 30 days to bound storage cost.
   rule {
-    id     = "expire-spark-logs"
+    id     = "expire-old-spark-logs"
     status = "Enabled"
     filter {
       prefix = "spark-logs/"
     }
     expiration {
-      days = 14
+      days = 30
     }
   }
 }

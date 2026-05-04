@@ -1,16 +1,19 @@
 {#
-    show_pending_rebuilds — preview what dbt would rebuild on the next run.
+    show_pending_rebuilds — audit query for aggregate / fct drift.
 
-    Mirrors the count-divergence detection logic the incremental models use,
-    but as a read-only query (no rebuild, no SWAP). Lets you see — without
-    running dbt — which (year, month) tuples have row counts in FCT_TRIPS
-    that don't match what's reflected in each aggregate.
+    Compares each aggregate mart's summed trip_count against FCT_TRIPS row
+    counts for the same (year, month). Drift means an aggregate is stale
+    relative to fct — typically caused by a partial dbt run or a manual
+    fct edit that didn't propagate to the aggregates.
 
-    Output: one row per (mart, year, month) that would be rebuilt, with the
-    fct count and the aggregate's summed trip_count side-by-side. Empty
-    output means dbt has nothing to do.
+    Read-only: doesn't rebuild anything, no SWAP. Empty output = marts are
+    in sync with fct.
 
-    Used by `make status`.
+    Output: one row per (mart, year, month) where counts diverge, with the
+    fct count and the aggregate's summed trip_count side-by-side.
+
+    Used by `make status`. To fix detected drift, run `make dbt TARGET=YYYY-MM`
+    for the affected month or trigger dbt_pipeline with the same target.
 #}
 {% macro show_pending_rebuilds() %}
 

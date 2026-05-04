@@ -11,21 +11,19 @@ models:
       Atomic trip-grain fact (Snowflake table: FCT_TRIPS). One row per VALID
       taxi trip, zone-joined. All 19 source columns from RAW.YELLOW_TRIPDATA
       are preserved (cast + renamed only) plus 7 derived columns + 6
-      zone-enrichment columns + 1 surrogate key + 2 load-metadata columns =
-      35 total. Source-of-truth that all aggregate marts (agg_*) build on.
+      zone-enrichment columns + 2 load-metadata columns = 35 total (includes
+      trip_bk). Source-of-truth that all aggregate marts (agg_*) build on.
       Clustered on (pickup_date, pu_location_id) — the two hottest predicates.
+      Merged on trip_bk so TLC corrections propagate to the current row.
     columns:
-      - name: trip_sk
+      - name: trip_bk
         description: >
-          Surrogate identifier (md5 hash of natural columns + source_filename).
-          Convenient single-column join key but NOT the dedup key — Spark and
-          dbt compute trip_sk independently, and engine-specific cast-to-string
-          formatting produces different hashes for the same physical trip. The
-          model's unique_key uses the natural-key tuple instead.
+          Business key surrogate — md5 of the 5 immutable trip identifiers.
+          Unique key for incremental merge; survives TLC corrections.
         data_type: VARCHAR
         tests:
           - not_null
-          - unique  # within a single engine's output, trip_sk IS unique
+          - unique
       - name: pu_location_id
         tests:
           - not_null
@@ -65,29 +63,25 @@ models:
         description: "$1.25 fee for pickups at JFK / LaGuardia. Zero elsewhere."
       - name: congestion_surcharge
         description: "$2.50 NYC congestion fee for trips entering/within Manhattan below 96th St."
-    tests:
-      # Natural-key uniqueness — the actual dedup mechanism. The 8 columns
-      # uniquely identify a real trip (and match dup_rank's partition spec
-      # in stg_yellow_trips so rule and key stay in sync).
-      - dbt_utils.unique_combination_of_columns:
-          combination_of_columns:
-            - vendor_id
-            - pickup_ts
-            - dropoff_ts
-            - pu_location_id
-            - do_location_id
-            - fare_amount
-            - total_amount
-            - payment_type
 
   - name: int_trips_quarantined
     description: >
       Audit fact (Snowflake table: FCT_TRIPS_QUARANTINED). Rows that failed
       staging validity rules, with the reason. Same column set as FCT_TRIPS
-      plus invalid_reason — investigators see full context for any
-      quarantined row. Persisted as a table so dirty-record analysis
+      plus quarantine_key and invalid_reason — investigators see full context
+      for any quarantined row. Persisted as a table so dirty-record analysis
       doesn't re-scan RAW. Volume is <1% of total trips.
     columns:
+      - name: quarantine_key
+        description: >
+          Deduplication surrogate (md5 of natural columns with null sentinel).
+          Used as unique_key for delete+insert so reruns are idempotent even
+          when natural key columns are NULL (e.g. null_timestamp rows).
+          Not intended as a business identifier.
+        data_type: VARCHAR
+        tests:
+          - not_null
+          - unique
       - name: invalid_reason
         tests:
           - not_null
