@@ -15,11 +15,9 @@ Watch this first — a one-shot code walkthrough plus a live end-to-end
 run. The README below has the same content in text form for reference.
 
 - **[Taxi Platform — code walkthrough and end-to-end run](https://drive.google.com/file/d/1TIV1tkNmbRhdhN273OEJwoL9SymTFghi/view?usp=sharing)**
-  — repo tour and the architectural decisions worth calling out (predicted
-  IAM ARN for single-apply Terraform, medallion layout with SCD Type 2,
-  trip_bk-based merge for TLC corrections, blue-green swap),
-  followed by a full demo from a fresh clone through `./scripts/bootstrap.sh`
-  to the Airflow DAGs running and data landing in Snowflake.
+  — repo tour followed by a full demo from a fresh clone through
+  `./scripts/bootstrap.sh` to the Airflow DAGs running and data landing
+  in Snowflake.
 
 ## Table of contents
 
