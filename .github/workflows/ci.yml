@@ -91,40 +91,19 @@ jobs:
           terraform -chdir=infra init -backend=false -input=false
           terraform -chdir=infra validate
 
-      - name: Airflow DagBag load test
+      - name: Airflow DagBag tests
+        # Single source of truth: airflow/tests/dags/test_dag_integrity.py.
+        # Same suite runs locally via `make test` (inside the Astro container);
+        # here we run it directly with Airflow on PYTHONPATH. PYTHONPATH=airflow
+        # mirrors the Astro layout so the DAGs' `from include.alerts import ...`
+        # resolves the same way it does in the worker container.
+        env:
+          PYTHONPATH: airflow
         run: |
           uv run --with 'apache-airflow==3.0.6' \
                  --with 'apache-airflow-providers-snowflake==6.12.2' \
                  --with 'apache-airflow-providers-amazon==9.27.0' \
-                 python -c "
-          import sys; sys.path.insert(0, 'airflow')
-          from airflow.models import DagBag
-          db = DagBag(dag_folder='airflow/dags', include_examples=False)
-          assert not db.import_errors, db.import_errors
-          assert set(db.dags.keys()) == {'dbt_pipeline', 'spark_historical'}, (
-              f'unexpected DAGs: {set(db.dags.keys())}'
-          )
-          dbt_tasks = {t.task_id for t in db.dags['dbt_pipeline'].tasks}
-          dbt_required = {
-              'compute_target_month', 'ingest_one_month', 'load_one_month_to_snowflake',
-              'dbt_build.reset_marts_build_from_marts',
-              'dbt_build.dbt_snapshot',
-              'dbt_build.swap_marts_blue_green',
-          }
-          assert not (dbt_required - dbt_tasks), (
-              f'dbt_pipeline missing tasks: {dbt_required - dbt_tasks}'
-          )
-          spark_tasks = {t.task_id for t in db.dags['spark_historical'].tasks}
-          spark_required = {
-              'ensure_year_in_s3',
-              'submit_emr_job', 'wait_for_emr',
-              'create_iceberg_tables', 'refresh_iceberg_tables',
-          }
-          assert not (spark_required - spark_tasks), (
-              f'spark_historical missing tasks: {spark_required - spark_tasks}'
-          )
-          print('DagBag OK — DAGs:', list(db.dags.keys()))
-          "
+                 pytest airflow/tests/dags/ -v
 
       # ---- Belt-and-suspenders: re-run pre-commit on the whole tree ---
       # Catches anything a developer's missing/disabled pre-commit hook
