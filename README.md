@@ -402,6 +402,12 @@ Terminal failures (after retries) email `ALERT_EMAIL` via Gmail SMTP.
 Per-retry alerts are off. Unset `ALERT_EMAIL` silently disables alerting.
 Update via `.env` + re-run `./scripts/bootstrap.sh`.
 
+Sample inbox view — one email per terminal task failure, subject line
+`[Airflow FAILED] <dag_id>.<task_id>`, body links straight to the
+Grid view log:
+
+![Airflow failure alerts in Gmail](docs/airflow_failure_alerts.png)
+
 ## dbt docs
 
 ```bash

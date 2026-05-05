@@ -77,16 +77,31 @@ from pyspark.sql import functions as F
 # casts is the only stable path; mergeSchema and explicit .schema() both fail
 # on TLC's drift.
 TLC_COLUMN_CASTS = [
+    # Natural-key columns (5) — partition key for dedupe + aggregation join keys.
     ("VendorID", "long"),
     ("tpep_pickup_datetime", "timestamp"),
     ("tpep_dropoff_datetime", "timestamp"),
-    ("trip_distance", "double"),
     ("PULocationID", "long"),
     ("DOLocationID", "long"),
+    # Aggregation / validity-rule columns.
+    ("trip_distance", "double"),
     ("payment_type", "long"),
     ("fare_amount", "double"),
     ("tip_amount", "double"),
     ("total_amount", "double"),
+    # Remaining non-key columns — present so the dedupe tiebreak ladder can
+    # rank truly-identical rows deterministically (must match the snapshot's
+    # final tiebreak in dbt/snapshots/snp_yellow_trips.sql column-for-column).
+    ("passenger_count", "double"),
+    ("extra", "double"),
+    ("mta_tax", "double"),
+    ("tolls_amount", "double"),
+    ("improvement_surcharge", "double"),
+    ("congestion_surcharge", "double"),
+    ("airport_fee", "double"),
+    ("cbd_congestion_fee", "double"),
+    ("RatecodeID", "double"),
+    ("store_and_fwd_flag", "string"),
 ]
 
 # Three output tables — fixed names. The DAG and Snowflake-side DDL
@@ -181,20 +196,103 @@ def read_year(spark: SparkSession, base_path: str, year: int) -> DataFrame:
 
 def filter_valid(df: DataFrame) -> DataFrame:
     """Apply the same validity gate as dbt's stg_yellow_trips. Keep in sync
-    with dbt/models/staging/stg_yellow_trips.sql."""
+    with dbt/models/staging/stg_yellow_trips.sql.
+
+    Order doesn't matter for the boolean filter (the ordering in the dbt
+    case-when only affects which `invalid_reason` label gets attached;
+    here we only care whether the row passes or not).
+    """
+    duration_min = (
+        F.unix_timestamp("tpep_dropoff_datetime") - F.unix_timestamp("tpep_pickup_datetime")
+    ) / 60.0
     return df.where(
         F.col("tpep_pickup_datetime").isNotNull()
         & F.col("tpep_dropoff_datetime").isNotNull()
         & (F.col("tpep_pickup_datetime") < F.col("tpep_dropoff_datetime"))
+        & (duration_min <= 720)  # duration_out_of_range
         & (F.col("trip_distance") > 0)
         & (F.col("trip_distance") <= 200)
         & (F.col("fare_amount") >= 0)
         & (F.col("fare_amount") <= 1000)
         & (F.col("total_amount") >= 0)
         & (F.col("total_amount") <= 1000)
+        & ~(F.col("tip_amount") > F.col("fare_amount"))  # tip_exceeds_fare_or_total (a)
+        & ~(F.col("tip_amount") > F.col("total_amount"))  # tip_exceeds_fare_or_total (b)
         & F.col("PULocationID").isNotNull()
         & F.col("DOLocationID").isNotNull()
         & F.col("payment_type").isin(1, 2, 3, 4, 5, 6)
+    )
+
+
+def dedupe_natural_key(df: DataFrame) -> DataFrame:
+    """Keep one row per natural key (VendorID, pickup_ts, dropoff_ts,
+    PULocationID, DOLocationID) — same 5 cols as dbt's trip_bk.
+
+    Tiebreak ordering MUST match dbt/snapshots/snp_yellow_trips.sql.
+    Both engines deterministically pick the copy most likely to pass
+    stg_yellow_trips' validity gate, so mixed-validity TLC duplicates
+    (e.g. one row with payment_type=1 and a ghost row with payment_type=0
+    for the same trip) collapse to the legitimate copy on both sides.
+    Without an aligned tiebreak the two engines' default orders
+    (Snowflake micro-partition vs Spark DataFrame partition) disagree
+    and produce systematic drift between MARTS.AGG_* and HISTORICAL.*.
+    """
+    pass_payment = F.when(F.col("payment_type").isin(1, 2, 3, 4, 5, 6), 0).otherwise(1)
+    pass_fare = F.when((F.col("fare_amount") >= 0) & (F.col("fare_amount") <= 1000), 0).otherwise(1)
+    pass_total = F.when(
+        (F.col("total_amount") >= 0) & (F.col("total_amount") <= 1000), 0
+    ).otherwise(1)
+    pass_distance = F.when(
+        (F.col("trip_distance") > 0) & (F.col("trip_distance") <= 200), 0
+    ).otherwise(1)
+    pass_tip = F.when(
+        (F.col("tip_amount") <= F.col("fare_amount"))
+        & (F.col("tip_amount") <= F.col("total_amount")),
+        0,
+    ).otherwise(1)
+
+    w = Window.partitionBy(
+        "VendorID",
+        "tpep_pickup_datetime",
+        "tpep_dropoff_datetime",
+        "PULocationID",
+        "DOLocationID",
+    ).orderBy(
+        # Match snp_yellow_trips' `_loaded_at desc, _ingest_batch_id desc`
+        # equivalent: Spark reads each parquet once, so there is no per-row
+        # _loaded_at — input_file_name is the analogous "load source" key.
+        F.input_file_name(),
+        # Content-aware tiebreak — 0 = passes rule, sorts before 1.
+        pass_payment,
+        pass_fare,
+        pass_total,
+        pass_distance,
+        pass_tip,
+        # Final stable tiebreak — column order MUST match the matching
+        # `nulls last` ladder in dbt/snapshots/snp_yellow_trips.sql so two
+        # truly-byte-identical rows are the only case where dedup falls
+        # back to engine-internal order (where the pick genuinely doesn't
+        # matter because the rows are interchangeable).
+        F.col("payment_type").asc_nulls_last(),
+        F.col("fare_amount").asc_nulls_last(),
+        F.col("tip_amount").asc_nulls_last(),
+        F.col("total_amount").asc_nulls_last(),
+        F.col("passenger_count").asc_nulls_last(),
+        F.col("trip_distance").asc_nulls_last(),
+        F.col("extra").asc_nulls_last(),
+        F.col("mta_tax").asc_nulls_last(),
+        F.col("tolls_amount").asc_nulls_last(),
+        F.col("improvement_surcharge").asc_nulls_last(),
+        F.col("congestion_surcharge").asc_nulls_last(),
+        F.col("airport_fee").asc_nulls_last(),
+        F.col("cbd_congestion_fee").asc_nulls_last(),
+        F.col("RatecodeID").asc_nulls_last(),
+        F.col("store_and_fwd_flag").asc_nulls_last(),
+    )
+    return (
+        df.withColumn("_dup_rank", F.row_number().over(w))
+        .where(F.col("_dup_rank") == 1)
+        .drop("_dup_rank")
     )
 
 
@@ -383,11 +481,21 @@ def main(argv: list[str] | None = None) -> int:
 
     db_fqn = f"{args.catalog}.{args.database}"
 
-    # One source read, one validity filter — cached so all three aggregations
-    # share the same underlying scan + filter pipeline. Without cache(),
-    # Spark would re-read parquet for each downstream aggregate.
+    # One source read, dedupe, validity filter — cached so all three
+    # aggregations share the same underlying scan + dedupe + filter
+    # pipeline. Without cache(), Spark would redo all three steps per
+    # aggregate.
+    #
+    # Operation ORDER matches dbt: snapshot dedupe first, then
+    # stg_yellow_trips applies the validity gate. Reversing the order
+    # would let Spark systematically retain the valid copy of a
+    # natural-key-duplicate pair where dbt may have arbitrarily picked
+    # the invalid copy and quarantined the trip — inflating Spark's
+    # output by the count of mixed-valid/invalid duplicate pairs (the
+    # most common TLC duplicate pattern: same 5-col natural key, one
+    # row with payment_type=1, one with payment_type=0).
     raw = read_year(spark, args.input, args.year)
-    valid = filter_valid(raw).cache()
+    valid = filter_valid(dedupe_natural_key(raw)).cache()
 
     ensure_iceberg_tables(spark, db_fqn)
 

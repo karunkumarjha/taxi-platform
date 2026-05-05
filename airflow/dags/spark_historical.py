@@ -29,7 +29,6 @@ Pre-ingest: `make ingest MONTHS=YYYY` (or let ensure_year_in_s3 do it).
 from __future__ import annotations
 
 import logging
-import os
 from datetime import datetime, timedelta
 
 from airflow.decorators import task
@@ -40,59 +39,13 @@ from airflow.sensors.base import PokeReturnValue
 
 log = logging.getLogger(__name__)
 
-_ALERT_EMAIL = os.environ.get("ALERT_EMAIL", "")
-
-
-def _send_failure_email(context: dict) -> None:
-    """Send a failure-alert email via direct smtplib.
-
-    Sidesteps Airflow 3.0.x's broken default failure-email template
-    (references `ti.mark_success_url` which doesn't exist on
-    RuntimeTaskInstance, crashing the send). See dbt_pipeline.py for the
-    full reasoning. Idempotent + safe: silently no-ops if ALERT_EMAIL is
-    unset and catches all SMTP exceptions.
-    """
-    import smtplib
-    from email.mime.text import MIMEText
-
-    if not _ALERT_EMAIL:
-        return
-
-    ti = context.get("task_instance") or context.get("ti")
-    if ti is None:
-        return
-
-    body = (
-        f"Task {ti.dag_id}.{ti.task_id} FAILED.\n\n"
-        f"Run ID:        {getattr(ti, 'run_id', 'unknown')}\n"
-        f"Try number:    {getattr(ti, 'try_number', '?')}\n"
-        f"Logical date:  {context.get('logical_date', '?')}\n\n"
-        f"Check the Airflow UI Grid view for the full task log."
-    )
-    msg = MIMEText(body)
-    msg["Subject"] = f"[Airflow FAILED] {ti.dag_id}.{ti.task_id}"
-    msg["From"] = os.environ.get("AIRFLOW__SMTP__SMTP_MAIL_FROM", _ALERT_EMAIL)
-    msg["To"] = _ALERT_EMAIL
-
-    try:
-        host = os.environ["AIRFLOW__SMTP__SMTP_HOST"]
-        port = int(os.environ.get("AIRFLOW__SMTP__SMTP_PORT", "587"))
-        with smtplib.SMTP(host, port, timeout=30) as smtp:
-            if os.environ.get("AIRFLOW__SMTP__SMTP_STARTTLS", "True").lower() == "true":
-                smtp.starttls()
-            user = os.environ.get("AIRFLOW__SMTP__SMTP_USER")
-            pwd = os.environ.get("AIRFLOW__SMTP__SMTP_PASSWORD")
-            if user and pwd:
-                smtp.login(user, pwd)
-            smtp.send_message(msg)
-    except Exception as e:  # noqa: BLE001 — last-ditch alert; don't propagate
-        log.warning("failure-email send failed: %s", e)
-
+# Failure alerting — shared smtplib callback. See include/alerts.py.
+from include.alerts import ALERT_EMAIL, on_failure_callback  # noqa: E402
 
 DEFAULT_ARGS = {
     "owner": "data-platform",
     "depends_on_past": False,
-    "on_failure_callback": [_send_failure_email] if _ALERT_EMAIL else [],
+    "on_failure_callback": [on_failure_callback] if ALERT_EMAIL else [],
     "retries": 2,
     "retry_delay": timedelta(minutes=5),
 }

@@ -47,64 +47,19 @@ if str(REPO_ROOT) not in sys.path:
 SF_LOADER_CONN_ID = "snowflake_loader"
 SF_DBT_CONN_ID = "snowflake_dbt"
 
-# Failure-alert recipient comes from the ALERT_EMAIL env var rendered into
-# airflow/.env by bootstrap. Empty string → alerting silently disabled
-# (no crash, no email) so the DAG still runs in environments without SMTP.
-_ALERT_EMAIL = os.environ.get("ALERT_EMAIL", "")
-
-
-def _send_failure_email(context: dict) -> None:
-    """Failure alert via direct smtplib.
-
-    Sidesteps Airflow 3.0.x's built-in email_on_failure, whose Jinja
-    template crashes on `ti.mark_success_url` (doesn't exist on the new
-    RuntimeTaskInstance). Silent no-op when ALERT_EMAIL unset; SMTP
-    exceptions are swallowed so a bad mailbox doesn't break task failure handling.
-    """
-    import smtplib
-    from email.mime.text import MIMEText
-
-    if not _ALERT_EMAIL:
-        return
-
-    ti = context.get("task_instance") or context.get("ti")
-    if ti is None:
-        return
-
-    body = (
-        f"Task {ti.dag_id}.{ti.task_id} FAILED.\n\n"
-        f"Run ID:        {getattr(ti, 'run_id', 'unknown')}\n"
-        f"Try number:    {getattr(ti, 'try_number', '?')}\n"
-        f"Logical date:  {context.get('logical_date', '?')}\n\n"
-        f"Check the Airflow UI Grid view for the full task log."
-    )
-    msg = MIMEText(body)
-    msg["Subject"] = f"[Airflow FAILED] {ti.dag_id}.{ti.task_id}"
-    msg["From"] = os.environ.get("AIRFLOW__SMTP__SMTP_MAIL_FROM", _ALERT_EMAIL)
-    msg["To"] = _ALERT_EMAIL
-
-    try:
-        host = os.environ["AIRFLOW__SMTP__SMTP_HOST"]
-        port = int(os.environ.get("AIRFLOW__SMTP__SMTP_PORT", "587"))
-        with smtplib.SMTP(host, port, timeout=30) as smtp:
-            if os.environ.get("AIRFLOW__SMTP__SMTP_STARTTLS", "True").lower() == "true":
-                smtp.starttls()
-            user = os.environ.get("AIRFLOW__SMTP__SMTP_USER")
-            pwd = os.environ.get("AIRFLOW__SMTP__SMTP_PASSWORD")
-            if user and pwd:
-                smtp.login(user, pwd)
-            smtp.send_message(msg)
-    except Exception as e:  # noqa: BLE001 — last-ditch alert; don't propagate
-        log.warning("failure-email send failed: %s", e)
-
+# Failure alerting — shared smtplib callback in airflow/include/alerts.py.
+# ALERT_EMAIL is rendered into airflow/.env by bootstrap; empty string →
+# alerting silently disabled (no crash, no email) so the DAG still runs
+# in environments without SMTP.
+from include.alerts import ALERT_EMAIL, on_failure_callback  # noqa: E402
 
 DEFAULT_ARGS = {
     "owner": "data-platform",
     "depends_on_past": False,
     # Airflow 3.0.x's built-in email_on_failure is broken (template bug);
-    # use on_failure_callback with smtplib directly. Empty list when
-    # ALERT_EMAIL is unset → alerting silently disabled.
-    "on_failure_callback": [_send_failure_email] if _ALERT_EMAIL else [],
+    # use on_failure_callback with smtplib directly via the shared
+    # include.alerts module.
+    "on_failure_callback": [on_failure_callback] if ALERT_EMAIL else [],
     "retries": 1,
     "retry_delay": timedelta(minutes=5),
 }
