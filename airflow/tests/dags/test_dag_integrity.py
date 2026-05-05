@@ -75,7 +75,9 @@ def test_dbt_pipeline_has_swap_task(dagbag: DagBag) -> None:
 
 def test_spark_historical_shape(dagbag: DagBag) -> None:
     """spark_historical: manual-trigger only, year Param required.
-    Tasks: submit → wait → create_iceberg → refresh_iceberg."""
+    Tasks: ensure → submit → wait → create_iceberg_tables → refresh_iceberg_tables.
+    The trailing two are plural — each loops over the 3 historical Iceberg tables
+    (DAILY_AGG, SUPPLY_GAPS, TIP_BEHAVIOUR)."""
     dag = dagbag.dags["spark_historical"]
     schedule = getattr(dag, "schedule", getattr(dag, "schedule_interval", None))
     assert schedule is None
@@ -87,7 +89,7 @@ def test_spark_historical_shape(dagbag: DagBag) -> None:
         "ensure_year_in_s3",
         "submit_emr_job",
         "wait_for_emr",
-        "create_iceberg_table",
-        "refresh_iceberg",
+        "create_iceberg_tables",
+        "refresh_iceberg_tables",
     }
     assert expected.issubset(task_ids), f"missing tasks: {expected - task_ids}"

@@ -1,6 +1,6 @@
 .PHONY: help setup fmt lint test hooks-install requirements status docs \
         infra-init infra-plan infra-apply infra-destroy \
-        ingest load dbt dbt-backfill swap aws-all \
+        ingest load dbt dbt-backfill swap aws-all detect-drift \
         spark-historical spark-deploy
 
 help:
@@ -45,6 +45,8 @@ help:
 	@echo "  hooks-install    Install pre-commit hooks (one-time per clone)"
 	@echo "  requirements     Regenerate requirements.txt + requirements-dev.txt from pyproject.toml"
 	@echo "  status           Show months/years where aggregates have drifted from FCT_TRIPS (DBT role)"
+	@echo "  detect-drift     HEAD CloudFront ETag and compare vs RAW.SOURCE_FINGERPRINTS for one month."
+	@echo "                   Prints: new | unchanged | drifted. Required: TARGET=YYYY-MM"
 	@echo "  docs             Generate + serve dbt docs site at http://localhost:8081"
 	@echo "                   (model lineage, test catalog, column descriptions)"
 
@@ -83,6 +85,12 @@ infra-apply:
 	$(WITH_ROLE) tf bash -c 'cd infra && terraform apply'
 
 infra-destroy:
+	@echo ">>> pre-destroy: dropping out-of-band Iceberg table as DBT role (if any)"
+	-@$(WITH_ROLE) dbt uv run dbt run-operation drop_historical_iceberg \
+	    --project-dir dbt --profiles-dir dbt 2>/dev/null \
+	    || echo "    (skipped — DBT role / database / table not reachable)"
+	@echo ">>> pre-destroy: clearing legacy cleanup resource from state (if present)"
+	-@terraform -chdir=infra state rm 'snowflake_execute.historical_iceberg_table_cleanup' 2>/dev/null || true
 	$(WITH_ROLE) tf bash -c 'cd infra && terraform destroy -auto-approve'
 
 # --- Pipeline ------------------------------------------------------------
@@ -146,6 +154,21 @@ dbt-backfill:
 	echo "backfilling dbt_pipeline: $$DBT_START → $$DBT_END"; \
 	cd airflow && astro dev run dags backfill dbt_pipeline \
 	    --start-date $${DBT_START}-01 --end-date $${DBT_END}-01
+
+# Ad-hoc drift detection for a single month — same logic the
+# detect_source_drift task runs at the head of every DagRun, exposed for
+# operators who want to check whether TLC has republished a file outside
+# the normal cadence. Reads RAW.SOURCE_FINGERPRINTS via the LOADER role.
+#   make detect-drift TARGET=2023-03
+detect-drift:
+	@if [ -z "$(TARGET)" ]; then \
+	    echo "ERROR: provide TARGET=YYYY-MM"; \
+	    exit 1; \
+	fi
+	@TARGET_YEAR=$$(echo $(TARGET) | cut -c1-4); \
+	TARGET_MONTH=$$(echo $(TARGET) | cut -c6-7 | sed 's/^0//'); \
+	$(WITH_ROLE) loader uv run python -m ingestion.detect_drift \
+	    --year $$TARGET_YEAR --month $$TARGET_MONTH
 
 # One-shot end-to-end for a single month (TARGET=YYYY-MM): ingest TLC, COPY
 # into RAW, run the full dbt build. Mirrors what one dbt_pipeline DAG run does.

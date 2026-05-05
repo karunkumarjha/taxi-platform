@@ -3,12 +3,18 @@ version: 2
 # Atomic facts (FCT_TRIPS, FCT_TRIPS_QUARANTINED) are defined in
 # models/intermediate/schema.yml. DIM_ZONES is in seeds/schema.yml.
 # This file describes the AGGREGATE marts that read from those.
+#
+# Layout: four monthly marts (incremental on target_year + target_month
+# from Airflow) and four yearly marts (incremental on target_year, derived
+# from the monthly marts). The yearly marts are tables, not views, since
+# dashboards / yearly-rank queries are read-heavy and the build cost from
+# already-aggregated monthly data is trivial.
 
 models:
-  # ===== Aggregate facts (build on int_trips_enriched a.k.a. FCT_TRIPS) =====
+  # ===== Monthly marts (read FCT_TRIPS, scoped to one month per Airflow run) =====
 
   - name: agg_zone_revenue_monthly
-    description: "Aggregate serving business Q1 (zone revenue + monthly rank shift)."
+    description: "Aggregate serving business Q1 (zone revenue + monthly rank)."
     columns:
       - name: pickup_year
         tests: [not_null]
@@ -37,11 +43,13 @@ models:
       - name: revenue_rank_in_month
         tests:
           - not_null
+      - name: mart_built_at
+        tests: [not_null]
     tests:
       - dbt_utils.unique_combination_of_columns:
           combination_of_columns: [pickup_year, pickup_month, pu_location_id]
 
-  - name: agg_hourly_demand
+  - name: agg_hourly_demand_monthly
     description: "Aggregate serving business Q2 (hour × DOW demand + avg fare)."
     columns:
       - name: pickup_hour
@@ -62,12 +70,14 @@ models:
               min_value: 1
       - name: avg_fare
         tests: [not_null]
+      - name: mart_built_at
+        tests: [not_null]
     tests:
       - dbt_utils.unique_combination_of_columns:
           combination_of_columns: [pickup_year, pickup_month, pickup_dow, pickup_hour]
 
-  - name: agg_zone_supply_gaps
-    description: "Aggregate serving business Q3 (supply gaps by zone per day). Incremental."
+  - name: agg_zone_supply_gaps_daily
+    description: "Aggregate serving business Q3 (supply gaps by zone per day)."
     columns:
       - name: pickup_date
         tests: [not_null]
@@ -82,13 +92,23 @@ models:
           - dbt_expectations.expect_column_values_to_be_between:
               min_value: 0
               max_value: 1440   # a single day's upper bound
+      - name: mart_built_at
+        tests: [not_null]
     tests:
       - dbt_utils.unique_combination_of_columns:
           combination_of_columns: [pickup_date, pu_location_id]
 
-  - name: agg_zone_tip_behaviour
-    description: "Aggregate serving business Q4 (tip % by distance bucket × payment type × zone)."
+  - name: agg_zone_tip_behaviour_monthly
+    description: "Aggregate serving business Q4 (tip % by month × distance bucket × payment type × zone). Month-grain (was year-grain pre-refactor)."
     columns:
+      - name: pickup_year
+        tests: [not_null]
+      - name: pickup_month
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 1
+              max_value: 12
       - name: pu_location_id
         tests:
           - not_null
@@ -103,7 +123,106 @@ models:
         tests:
           - accepted_values:
               values: [1, 2, 3, 4, 5, 6]
+      - name: mart_built_at
+        tests: [not_null]
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns:
+            [pickup_year, pickup_month, pu_location_id, distance_bucket, payment_type]
+
+  # ===== Yearly marts (read the monthly marts; full-year rebuild per run) =====
+
+  - name: agg_zone_revenue_yearly
+    description: "Yearly rollup of zone revenue with cross-zone yearly rank. Q1 'across 2023'."
+    columns:
+      - name: pickup_year
+        tests: [not_null]
+      - name: pu_location_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_zones')
+              field: location_id
+      - name: yearly_gross_revenue
+        tests:
+          - not_null
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+      - name: yearly_revenue_rank
+        tests: [not_null]
+      - name: mart_built_at
+        tests: [not_null]
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [pickup_year, pu_location_id]
+
+  - name: agg_zone_tip_behaviour_yearly
+    description: "Yearly rollup of tip behaviour. Trip-weighted averages, no percentiles (not summable)."
+    columns:
+      - name: pickup_year
+        tests: [not_null]
+      - name: pu_location_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_zones')
+              field: location_id
+      - name: distance_bucket
+        tests:
+          - accepted_values:
+              values: ['0-1mi', '1-3mi', '3-5mi', '5-10mi', '10-20mi', '20mi+']
+      - name: payment_type
+        tests:
+          - accepted_values:
+              values: [1, 2, 3, 4, 5, 6]
+      - name: mart_built_at
+        tests: [not_null]
     tests:
       - dbt_utils.unique_combination_of_columns:
           combination_of_columns:
             [pickup_year, pu_location_id, distance_bucket, payment_type]
+
+  - name: agg_hourly_demand_yearly
+    description: "Yearly rollup of hourly demand — typical hour-of-day pattern across the year."
+    columns:
+      - name: pickup_year
+        tests: [not_null]
+      - name: pickup_dow
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 1
+              max_value: 7
+      - name: pickup_hour
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0
+              max_value: 23
+      - name: mart_built_at
+        tests: [not_null]
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [pickup_year, pickup_dow, pickup_hour]
+
+  - name: agg_zone_supply_gaps_yearly
+    description: "Yearly rollup of supply gaps — answers 'zones that REGULARLY go without pickups'."
+    columns:
+      - name: pickup_year
+        tests: [not_null]
+      - name: pu_location_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_zones')
+              field: location_id
+      - name: longest_gap_min_year
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+              max_value: 1440
+      - name: mart_built_at
+        tests: [not_null]
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [pickup_year, pu_location_id]

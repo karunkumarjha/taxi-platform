@@ -25,8 +25,7 @@
 #       `make spark-deploy` after script edits.)
 #   7.  astro dev kill && astro dev start (forces fresh metadata DB so
 #       airflow_settings.yaml re-imports cleanly).
-#   8.  Wait for the scheduler to be ready.
-#   9.  Unpause dbt_pipeline. With catchup=False + @monthly schedule,
+#   8.  Unpause dbt_pipeline. With catchup=False + @monthly schedule,
 #       Airflow creates exactly ONE scheduled DagRun for the most recent
 #       cron tick — no backfill, no duplicate manual run. That run uses
 #       lag_months=2, targeting the most recently published TLC month,
@@ -73,7 +72,7 @@ REPO_ROOT="$(pwd)"
 # 1. Pre-flight
 # ----------------------------------------------------------------------------
 
-step "1/9  Pre-flight checks"
+step "1/8  Pre-flight checks"
 
 for cmd in uv terraform astro docker aws; do
     command -v "$cmd" >/dev/null 2>&1 || die "missing required tool: $cmd
@@ -169,7 +168,7 @@ echo "    .env looks good (SNOWFLAKE_ACCOUNT=$SNOWFLAKE_ACCOUNT, AWS_REGION=$AWS
 # 2. Python deps + hooks
 # ----------------------------------------------------------------------------
 
-step "2/9  Installing Python deps + pre-commit hooks"
+step "2/8  Installing Python deps + pre-commit hooks"
 
 uv sync --all-groups --quiet
 uv run pre-commit install --install-hooks >/dev/null
@@ -178,7 +177,7 @@ uv run pre-commit install --install-hooks >/dev/null
 # 3. Terraform init + apply
 # ----------------------------------------------------------------------------
 
-step "3/9  Provisioning AWS + Snowflake via Terraform (~5 min on first run — Glue + EMR + Snowflake)"
+step "3/8  Provisioning AWS + Snowflake via Terraform (~5 min on first run — Glue + EMR + Snowflake)"
 
 # Non-interactive apply for the bootstrap path. Bypasses `make infra-apply`
 # (which prompts for yes/no — appropriate for an engineer running it by
@@ -194,7 +193,7 @@ make infra-init >/dev/null
 # 4. Append terraform outputs to .env (idempotent)
 # ----------------------------------------------------------------------------
 
-step "4/9  Capturing terraform outputs into .env"
+step "4/8  Capturing terraform outputs into .env"
 
 OUTPUT_MARKER="# --- bootstrap.sh: terraform outputs ---"
 
@@ -240,7 +239,7 @@ set -a; . ./.env; set +a
 # 5. Render airflow_settings.yaml
 # ----------------------------------------------------------------------------
 
-step "5/9  Rendering airflow/airflow_settings.yaml + airflow/.env + dbt/profiles.yml"
+step "5/8  Rendering airflow/airflow_settings.yaml + airflow/.env + dbt/profiles.yml"
 
 S3_BUCKET=$(terraform -chdir=infra output -raw s3_bucket)
 LOADER_PWD=$(terraform -chdir=infra output -raw snowflake_loader_password)
@@ -291,7 +290,7 @@ fi
 # 6. Deploy PySpark script to S3 (so EMR Serverless can fetch it)
 # ----------------------------------------------------------------------------
 
-step "6/9  Deploying spark/process_historical.py to S3"
+step "6/8  Deploying spark/process_historical.py to S3"
 
 # Idempotent: aws s3 cp overwrites by default. Re-run `make spark-deploy`
 # after editing the script to push the new version without re-running the
@@ -305,7 +304,7 @@ echo "    deployed → s3://${S3_BUCKET}/spark-scripts/process_historical.py"
 # 7. Astro: kill (wipes metadata) + start (re-imports settings)
 # ----------------------------------------------------------------------------
 
-step "7/9  Bringing up Airflow via Astro (kill + start to refresh settings)"
+step "7/8  Bringing up Airflow via Astro (kill + start to refresh settings)"
 
 # Astro's runtime base image has `ONBUILD COPY packages.txt requirements.txt .`
 # instructions that fire unconditionally. The files must exist (even if empty)
@@ -320,30 +319,10 @@ step "7/9  Bringing up Airflow via Astro (kill + start to refresh settings)"
 (cd airflow && astro dev start)
 
 # ----------------------------------------------------------------------------
-# 8. Wait for scheduler ready
+# 8. Unpause dbt_pipeline (smoke test — latest scheduled run fires automatically)
 # ----------------------------------------------------------------------------
 
-step "8/9  Waiting for Airflow scheduler to be ready (~30s)"
-
-# Poll the webserver until 200, max 90s.
-for i in $(seq 1 30); do
-    if curl -fsS http://localhost:8080/api/v1/health >/dev/null 2>&1 \
-       || curl -fsS http://localhost:8080/health  >/dev/null 2>&1; then
-        echo "    Airflow is up"
-        break
-    fi
-    sleep 3
-    if [[ $i -eq 30 ]]; then
-        warn "Airflow didn't respond on /health within 90s — DAG triggers may fail.
-        Try: cd airflow && astro dev logs"
-    fi
-done
-
-# ----------------------------------------------------------------------------
-# 9. Unpause dbt_pipeline (smoke test — latest scheduled run fires automatically)
-# ----------------------------------------------------------------------------
-
-step "9/9  Unpausing dbt_pipeline (latest scheduled @monthly run fires automatically)"
+step "8/8  Unpausing dbt_pipeline (latest scheduled @monthly run fires automatically)"
 
 # Unpause instead of trigger. Why:
 #   • catchup=False + @monthly + unpausing = exactly ONE scheduled DagRun
@@ -402,7 +381,7 @@ ${BOLD}${GREEN}✓ bootstrap complete.${NC}
 
     -- Gold (historical, Iceberg via Glue) — populated by spark_historical DAG.
     -- Empty until that DAG has been triggered for at least one year.
-    SELECT COUNT(*) FROM ANALYTICS.HISTORICAL.HISTORICAL_DAILY_AGG;
+    SELECT COUNT(*) FROM ANALYTICS.HISTORICAL.DAILY_AGG;
 
   When you're done:
     cd airflow && astro dev stop

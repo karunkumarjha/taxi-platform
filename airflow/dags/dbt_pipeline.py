@@ -1,66 +1,23 @@
 """
-dbt_pipeline — per-month incremental dbt build with SCD snapshot.
-
-The single Airflow DAG for the platform. One DagRun = one month.
+dbt_pipeline — per-month incremental dbt build with SCD snapshot. One DagRun = one month.
 
 Trigger sources:
-  • @monthly cron — live fire; ingests the target month's TLC parquet
-    and runs the full dbt build (snapshot + staging + intermediate +
-    marts + blue-green swap).
-  • Operator-driven backfill — `airflow dags backfill dbt_pipeline
-    --start-date YYYY-MM-DD --end-date YYYY-MM-DD`, wrapped by
-    `make dbt-backfill`. Same DAG, max_active_runs=1 serializes the
-    range into one DagRun per month. The DAG auto-detects
-    run_type=backfill and uses lag_months=0 so START/END are literal
-    data months.
-  • Manual UI trigger — for re-running a specific month after a fix.
-    Pass `target_year` + `target_month` in conf to override the auto
-    target-month computation.
+  • @monthly cron (live)
+  • `airflow dags backfill` / `make dbt-backfill` (historical, sequential via max_active_runs=1)
+  • Manual UI trigger with target_year/target_month in conf (re-run a specific month)
 
-Target month resolution (compute_target_month):
-  1. dag_run.conf has target_year + target_month → use them directly.
-  2. run_type='backfill' → use data_interval_start (the literal data
-     month the operator passed via --start-date / --end-date).
-  3. Otherwise (scheduled / manual) → today's calendar date − lag_months.
-     Anchored on today() rather than logical_date because in Airflow 3.x
-     logical_date == run_after (end of interval), and even in 2.x for
-     @monthly + catchup=False it sits at the start of the previous data
-     interval — both put us off the real-world TLC publishing cadence.
+Per-run flow:
+    compute_target_month  →  detect_source_drift  →  partition_replace_if_drifted
+        →  ingest_one_month  →  load_one_month_to_snowflake
+        →  dbt_build (deps → freshness → reset_marts_build → snapshot → seed
+                      → staging → intermediate → marts → swap_marts)
+        →  record_fingerprint   (post-build only — failed run leaves stored ETag for retry)
 
-dbt build flow per run:
-
-    compute_target_month               (year + month for this run)
-            │
-    ingest_one_month                   (TLC CloudFront → S3 raw/;
-                                         HEAD-skip idempotent)
-            │
-    load_one_month_to_snowflake        (COPY INTO RAW.YELLOW_TRIPDATA;
-                                         FORCE=TRUE, audit columns)
-            │
-    dbt_build (TaskGroup):
-        dbt_deps
-          → dbt_source_freshness
-          → reset_marts_build_from_marts   (clone MARTS → MARTS_BUILD)
-          → dbt_snapshot                   (SCD Type 2: snp_yellow_trips)
-          → dbt_seed
-          → dbt_build_staging              (reads from snapshot; is a view)
-          → dbt_build_intermediate         (merge on trip_bk, month-scoped)
-          → dbt_build_marts                (aggregates from fct_trips)
-          → swap_marts_blue_green
-
-Bronze/Silver/Gold medallion layers:
-  Bronze — RAW.YELLOW_TRIPDATA (append-only, FORCE=TRUE, _ingest_batch_id)
-  Silver — SNAPSHOTS.snp_yellow_trips (SCD Type 2, trip_bk unique key)
-  Gold   — MARTS.FCT_TRIPS + aggregates (valid trips, zone-enriched,
-             merged on trip_bk so TLC corrections overwrite stale rows)
-
-Scheduled runs:
-    schedule="@monthly" start_date=2009-01-01 catchup=False
-
-Backfill:
-    airflow dags backfill dbt_pipeline --start-date 2023-01-01 --end-date 2023-12-01
-    Set lag_months=0 so start/end ARE the data months. max_active_runs=1
-    keeps runs sequential.
+target_month resolution (compute_target_month):
+  1. dag_run.conf has target_year + target_month → use directly.
+  2. run_type='backfill' → use data_interval_start (literal data month from --start-date).
+  3. Else → today − lag_months. Anchored on today() because Airflow 3.x's logical_date
+     equals run_after (end of interval), which puts us off TLC's real publishing cadence.
 """
 
 from __future__ import annotations
@@ -97,18 +54,12 @@ _ALERT_EMAIL = os.environ.get("ALERT_EMAIL", "")
 
 
 def _send_failure_email(context: dict) -> None:
-    """Send a failure-alert email via direct smtplib.
+    """Failure alert via direct smtplib.
 
-    Why not Airflow's built-in email_on_failure? Airflow 3.0.x's default
-    failure-email Jinja template references `ti.mark_success_url`, which
-    doesn't exist on the new RuntimeTaskInstance — the email send crashes
-    with a Jinja UndefinedError and no alert goes out. This callback
-    sidesteps the template entirely, reading SMTP config from env vars
-    rendered into airflow/.env by bootstrap.
-
-    Idempotent + safe: silently no-ops if ALERT_EMAIL is unset, and
-    catches all SMTP exceptions so a misconfigured mailbox doesn't bring
-    down the actual task's failure handling.
+    Sidesteps Airflow 3.0.x's built-in email_on_failure, whose Jinja
+    template crashes on `ti.mark_success_url` (doesn't exist on the new
+    RuntimeTaskInstance). Silent no-op when ALERT_EMAIL unset; SMTP
+    exceptions are swallowed so a bad mailbox doesn't break task failure handling.
     """
     import smtplib
     from email.mime.text import MIMEText
@@ -229,26 +180,14 @@ with DAG(
 
     @task(task_id="compute_target_month")
     def compute_target_month(**context) -> dict:
-        """Derive (year, month) for this run.
+        """Derive (year, month) for this run, in priority order:
+          1. dag_run.conf['target_year' + 'target_month']  — manual UI re-run
+          2. run_type='backfill'                          — data_interval_start
+          3. scheduled / manual                            — today − lag_months
 
-        Priority:
-          1. dag_run.conf['target_year'] + conf['target_month'] — set by
-             a manual UI trigger that wants to re-run a specific month.
-          2. Backfill runs (run_type='backfill') — use logical_date
-             directly, since `--start-date YYYY-MM-01 --end-date YYYY-MM-01`
-             means the operator wants those literal data months processed.
-          3. Scheduled / manual runs — use TODAY's calendar date minus
-             lag_months. This intentionally ignores Airflow's logical_date
-             because for `@monthly` schedules logical_date is the START of
-             the previous data interval, which would put us one month
-             behind what TLC has actually published. We want "the most
-             recent month TLC publishes" which tracks the real-world
-             calendar, not the schedule semantics.
-
-        Refuses any target newer than today − 2 months (the publishing-lag
-        cap). TLC publishes ~2 months in arrears, so anything more recent
-        isn't published yet — ingest_one_month would just retry-loop until
-        it gave up. Failing fast here surfaces the bad input clearly.
+        Anchored on today() (not logical_date) for scheduled runs because
+        Airflow 3.x's logical_date == run_after, which trails the actual
+        TLC publishing cadence. Refuses targets newer than today−2 months.
         """
         dag_run = context["dag_run"]
         conf = dag_run.conf or {}
@@ -315,30 +254,87 @@ with DAG(
         _enforce_publishing_lag(target)
         return target
 
+    @task(task_id="detect_source_drift")
+    def detect_source_drift(target: dict, **context) -> dict:
+        """HEAD CloudFront ETag, compare vs RAW.SOURCE_FINGERPRINTS.
+
+        Returns {"status": "new" | "unchanged" | "drifted", "filename": ...}.
+        Fingerprint is upserted later, post-build, by record_fingerprint —
+        so a failed run leaves it untouched and the next run retries.
+        """
+        from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
+
+        from ingestion.detect_drift import detect_drift
+
+        ym_tag = f"{target['year']:04d}-{target['month']:02d}"
+        filename = f"yellow_tripdata_{ym_tag}.parquet"
+
+        hook = SnowflakeHook(snowflake_conn_id=SF_LOADER_CONN_ID)
+        sf = hook.get_conn()
+        try:
+            raw_schema = (hook.get_connection(SF_LOADER_CONN_ID).extra_dejson or {}).get(
+                "raw_schema", "RAW"
+            )
+            status, fp = detect_drift(sf, filename, raw_schema=raw_schema)
+        finally:
+            sf.close()
+
+        log.info("drift %s: %s (etag=%s)", filename, status, fp.etag if fp else "n/a")
+        return {"status": status, "filename": filename}
+
+    @task(task_id="partition_replace_if_drifted", trigger_rule="none_failed")
+    def partition_replace_if_drifted(drift: dict, **context) -> dict:
+        """No-op unless drifted. On drift, wipe raw + snapshot rows for the file."""
+        if drift["status"] != "drifted":
+            return drift
+
+        from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
+
+        from ingestion.detect_drift import partition_replace
+
+        # DBT role has DELETE on raw + snapshots; LOADER does not.
+        hook = SnowflakeHook(snowflake_conn_id=SF_DBT_CONN_ID)
+        sf = hook.get_conn()
+        try:
+            db = (hook.get_connection(SF_DBT_CONN_ID).extra_dejson or {}).get(
+                "database", "ANALYTICS"
+            )
+            partition_replace(
+                sf,
+                drift["filename"],
+                raw_table=f"{db}.RAW.YELLOW_TRIPDATA",
+                snapshot_table=f"{db}.SNAPSHOTS.SNP_YELLOW_TRIPS",
+            )
+            sf.commit()
+        finally:
+            sf.close()
+        return drift
+
     @task(
         task_id="ingest_one_month",
         retries=6,
         retry_delay=timedelta(hours=12),
         retry_exponential_backoff=False,
     )
-    def ingest_one_month(target: dict, **context) -> str:
-        """Stream this month's TLC parquet into S3 raw/. Idempotent (HEAD check)."""
+    def ingest_one_month(target: dict, drift: dict, **context) -> str:
+        """CloudFront → S3 raw/. force=True if drift detected."""
         from ingestion.ingest_tlc import Month, ingest_missing
 
         bucket = Variable.get("s3_bucket")
         prefix = Variable.get("s3_raw_prefix", default_var="raw/")
         month = Month(target["year"], target["month"])
-        uploaded = ingest_missing([month], bucket=bucket, prefix=prefix)
-        log.info("uploaded=%d (0 = file was already present)", len(uploaded))
+        force = drift.get("status") == "drifted"
+        uploaded = ingest_missing([month], bucket=bucket, prefix=prefix, force=force)
+        log.info(
+            "uploaded=%d force=%s (0 + force=False = file was already present)",
+            len(uploaded),
+            force,
+        )
         return month.tag
 
     @task(task_id="load_one_month_to_snowflake", retries=1)
     def load_one_month_to_snowflake(target: dict, **context) -> str:
-        """COPY INTO RAW.YELLOW_TRIPDATA scoped to one file. FORCE=TRUE
-        makes RAW append-only — every load event is a new row set with
-        fresh `_ingest_batch_id` and `_loaded_by`. The snapshot dedupes
-        downstream so MARTS stays canonical.
-        """
+        """COPY INTO RAW.YELLOW_TRIPDATA, FORCE=TRUE (append-only). Snapshot dedupes downstream."""
         from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 
         from ingestion.load_snowflake import (
@@ -379,12 +375,7 @@ with DAG(
     # ---- dbt build ---------------------------------------------------------
 
     def _dbt_build_layer(task_id: str, select: str, *, retries: int = 0) -> BashOperator:
-        """Build a per-layer `dbt build` BashOperator.
-
-        Passes target_year / target_month as dbt vars so incremental models
-        (int_trips_enriched, int_trips_quarantined) scope their merge to the
-        single month being processed in this DAG run.
-        """
+        """Per-layer `dbt build`. Passes target vars so incremental models scope correctly."""
         return BashOperator(
             task_id=task_id,
             bash_command=(
@@ -428,10 +419,8 @@ with DAG(
             cwd=str(DBT_PROJECT_DIR),
             retries=0,
         )
-        # SCD Type 2 snapshot — runs over ALL of RAW each time, appending
-        # new versions for corrected rows (TLC corrections) and inserting
-        # new rows for newly loaded months. Writes to SNAPSHOTS schema
-        # directly (not MARTS_BUILD), so it persists across blue-green swaps.
+        # SCD2 snapshot. Writes to SNAPSHOTS schema, not MARTS_BUILD,
+        # so it persists across the blue-green swap.
         dbt_snapshot = BashOperator(
             task_id="dbt_snapshot",
             bash_command=f"dbt snapshot --profiles-dir {DBT_PROFILES_DIR}",
@@ -472,9 +461,38 @@ with DAG(
             >> swap_marts
         )
 
+    @task(task_id="record_fingerprint")
+    def record_fingerprint(drift: dict, **context) -> None:
+        """Persist new ETag post-build only. Failure leaves stored value untouched for retry."""
+        from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
+
+        from ingestion.detect_drift import fetch_tlc_fingerprint, upsert_fingerprint
+
+        filename = drift["filename"]
+        fp = fetch_tlc_fingerprint(filename)
+        if fp is None:
+            log.warning("no current fingerprint for %s — skipping record", filename)
+            return
+
+        hook = SnowflakeHook(snowflake_conn_id=SF_LOADER_CONN_ID)
+        sf = hook.get_conn()
+        try:
+            raw_schema = (hook.get_connection(SF_LOADER_CONN_ID).extra_dejson or {}).get(
+                "raw_schema", "RAW"
+            )
+            upsert_fingerprint(sf, fp, raw_schema=raw_schema)
+            sf.commit()
+        finally:
+            sf.close()
+        log.info("recorded %s: etag=%s", filename, fp.etag)
+
     # ---- wiring -----------------------------------------------------------
 
     target = compute_target_month()
-    uploaded = ingest_one_month(target)
+    drift = detect_source_drift(target)
+    replaced = partition_replace_if_drifted(drift)
+    uploaded = ingest_one_month(target, drift)
     loaded = load_one_month_to_snowflake(target)
-    target >> uploaded >> loaded >> dbt_build
+    fingerprint_recorded = record_fingerprint(drift)
+
+    target >> drift >> replaced >> uploaded >> loaded >> dbt_build >> fingerprint_recorded

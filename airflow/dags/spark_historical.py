@@ -1,65 +1,29 @@
 """
 spark_historical — manual-trigger DAG. Submits process_historical.py to
-EMR Serverless, which writes an Iceberg table registered in AWS Glue.
+EMR Serverless, which writes THREE Iceberg tables registered in AWS Glue.
 Snowflake reads zero-copy via CATALOG INTEGRATION.
 
-The DAG itself does NOT run Spark. Airflow is the control plane only —
-compute happens on EMR Serverless under the IAM exec role provisioned
-by `infra/emr.tf`. The DAG is a 5-task wrapper:
+Per-run shape (one year of data, configurable via the `year` Param):
 
-  1. ensure_year_in_s3       — pre-ingest the year's 12 parquet files
-                               from TLC CloudFront → S3 raw/ via the
-                               existing ingestion module. Idempotent
-                               (HEAD-skip): re-runs are quick no-ops
-  2. submit_emr_job          — boto3 start_job_run (Spark runs on EMR)
-  3. wait_for_emr            — sensor in `mode = reschedule` so the
-                               worker slot is FREED between pokes;
-                               polls job state every 60s until terminal
-  4. create_iceberg_table    — CREATE ICEBERG TABLE IF NOT EXISTS in
-                               Snowflake. Idempotent — first run
-                               creates, subsequent runs are no-ops
-  5. refresh_iceberg         — ALTER ICEBERG TABLE ... REFRESH so
-                               Snowflake picks up the new Glue snapshot
-                               immediately (without waiting for the
-                               30s catalog poll)
+  1. ensure_year_in_s3       — pre-ingest 12 parquet files from TLC
+                               CloudFront → S3 raw/. Idempotent (HEAD-skip).
+  2. submit_emr_job          — boto3 start_job_run; one Spark application
+                               produces all 3 outputs from a single source read.
+  3. wait_for_emr            — reschedule-mode sensor; polls every 60s,
+                               4h timeout, raises with EMR stateDetails on failure.
+  4. create_iceberg_tables   — CREATE ICEBERG TABLE IF NOT EXISTS for each
+                               of the 3 tables. Idempotent.
+  5. refresh_iceberg_tables  — ALTER ICEBERG TABLE ... REFRESH for each
+                               so Snowflake picks up the new Glue snapshots
+                               immediately (no 30-60s catalog-poll wait).
 
-Trigger via UI:
-  1. DAGs → spark_historical → ▶ Trigger DAG w/ config
-  2. Set Param `year` (default 2023; valid 2009–current year)
-  3. Trigger.
+End state:
+  • 3 Iceberg tables in glue.taxi_iceberg.{daily_agg,
+    supply_gaps, tip_behaviour} have the year's rows.
+  • Same 3 tables in ANALYTICS.HISTORICAL queryable by ANALYST.
 
-End state on success:
-  • Iceberg table glue.taxi_iceberg.historical_daily has the year's
-    daily-aggregation rows (replacing any previous data for that year)
-  • Snowflake table ANALYTICS.HISTORICAL.HISTORICAL_DAILY_AGG queryable
-    by the ANALYST role
-  • Daily-aggregation parquet files at
-    s3://<bucket>/historical-daily/<table>/data/year=YYYY/month=MM/
-
-Input source:
-  By default, the DAG reads from `s3://<bucket>/raw/` — the same
-  prefix `dbt_pipeline` and `make ingest` write to. Pre-ingest the year
-  before triggering:
-
-      make ingest MONTHS=2023            # downloads all 12 months of 2023
-
-  TLC's primary source is the CloudFront URL (used by ingest_tlc.py);
-  the legacy public S3 mirror at s3://nyc-tlc/ is no longer reliably
-  accessible from arbitrary AWS accounts. Override via the `tlc_source`
-  Airflow Variable if you have a different layout.
-
-Why no schedule:
-  Historical pre-aggregation is a backfill-style operation, not a
-  recurring one. Each year is run once when needed. Live monthly data
-  flows through dbt_pipeline; only 14+ years of historical bulk go
-  through this DAG.
-
-Resilience:
-  • Submit task — retries=2, retry_delay=5min for transient AWS API hiccups
-  • Sensor — mode=reschedule frees the worker between pokes; 4h timeout
-  • Sensor failure (FAILED / CANCELLED) raises immediately with the
-    EMR stateDetails string in the error message
-  • Refresh task is idempotent — safe to retry
+Trigger: DAGs → spark_historical → ▶ Trigger DAG w/ config → set `year`.
+Pre-ingest: `make ingest MONTHS=YYYY` (or let ensure_year_in_s3 do it).
 """
 
 from __future__ import annotations
@@ -137,13 +101,21 @@ DEFAULT_ARGS = {
 # the EXTERNAL VOLUME + CATALOG INTEGRATION (see infra/rbac.tf).
 SF_DBT_CONN_ID = "snowflake_dbt"
 
-# Iceberg table location in Snowflake — fixed names. Could be wired through
-# Airflow Variables but they're stable infra-side and changing them would
-# require coordinated Glue + Snowflake updates.
+# The 3 Iceberg tables Spark writes. Each tuple is
+# (Snowflake table name, Glue catalog table name). Keep these in sync with
+# the TABLE_* constants in spark/process_historical.py — changing either
+# requires a coordinated Glue + Snowflake update.
 SF_HISTORICAL_DB = "ANALYTICS"
 SF_HISTORICAL_SCHEMA = "HISTORICAL"
-SF_HISTORICAL_TABLE = "HISTORICAL_DAILY_AGG"
-SF_HISTORICAL_FQTN = f"{SF_HISTORICAL_DB}.{SF_HISTORICAL_SCHEMA}.{SF_HISTORICAL_TABLE}"
+HISTORICAL_TABLES: list[tuple[str, str]] = [
+    ("DAILY_AGG", "daily_agg"),
+    ("SUPPLY_GAPS", "supply_gaps"),
+    ("TIP_BEHAVIOUR", "tip_behaviour"),
+]
+
+
+def _sf_fqtn(snowflake_table: str) -> str:
+    return f"{SF_HISTORICAL_DB}.{SF_HISTORICAL_SCHEMA}.{snowflake_table}"
 
 
 with DAG(
@@ -183,20 +155,11 @@ with DAG(
         retry_delay=timedelta(minutes=5),
     )
     def ensure_year_in_s3(**context) -> int:
-        """Pre-ingest all months of the year from TLC CloudFront → S3 raw/.
+        """Mirror the year's TLC parquet from CloudFront → S3 raw/.
 
-        Why this is the first task: TLC's primary distribution is now
-        CloudFront (their public S3 mirror was retired); Spark can't read
-        CloudFront directly. We materialise the year's parquet into our
-        own bucket, then EMR reads from there.
-
-        Idempotent — `ingest_missing` HEAD-checks each S3 key first and
-        skips the upload if already present. Re-running the DAG for a
-        year that's already been ingested is a quick no-op (12 HEADs,
-        ~2s) rather than re-downloading ~3 GB.
-
-        Returns the count of files actually uploaded (0 if all already
-        present). Logged for visibility but not used downstream.
+        Spark can't read CloudFront directly; we stage to our own bucket
+        first. HEAD-skip idempotent — re-runs are ~2s no-ops, not 3 GB
+        re-downloads. Returns count uploaded (0 if all already present).
         """
         from ingestion.ingest_tlc import ingest_missing, months_for_year
 
@@ -219,7 +182,7 @@ with DAG(
         """Submit process_historical.py to EMR Serverless. Returns job_run_id.
 
         Spark conf wires up the Iceberg + Glue catalog so the script can
-        CREATE TABLE / DELETE / APPEND against `glue.taxi_iceberg.historical_daily`.
+        write all 3 tables under `glue.taxi_iceberg.*`.
         """
         import boto3
 
@@ -231,25 +194,15 @@ with DAG(
         glue_database = Variable.get("glue_database")
 
         entry_point = f"s3://{bucket}/spark-scripts/process_historical.py"
-        # Read from our own raw/ prefix. TLC's official primary source is
-        # now their CloudFront URL (the `ingestion/ingest_tlc.py` script
-        # uses it); the legacy `s3://nyc-tlc/*` mirror is no longer
-        # reliably accessible from arbitrary AWS accounts (returns 403
-        # even with full IAM grants — the bucket policy blocks
-        # cross-account reads).
-        #
-        # Workflow: pre-ingest the year via `make ingest MONTHS=YYYY`
-        # before triggering this DAG, OR via the dbt_pipeline live path
-        # over time. Each year's 12 monthly parquet files land in
-        # s3://<bucket>/raw/ and Spark reads them from there.
-        #
-        # Override via the `tlc_source` Airflow Variable if you have a
-        # different layout (e.g. an internal data-lake mirror).
+        # Read from our own raw/ — TLC's primary distribution is CloudFront
+        # (used by ingestion/ingest_tlc.py); the legacy s3://nyc-tlc/ mirror
+        # blocks cross-account reads. Pre-ingest via `make ingest MONTHS=YYYY`
+        # or via dbt_pipeline. Override via the `tlc_source` Airflow Variable.
         input_path = Variable.get("tlc_source", default_var=f"s3://{bucket}/raw/")
         warehouse = f"s3://{bucket}/historical-daily/"
 
         log.info(
-            "submitting EMR job: app=%s year=%d catalog=glue.%s.historical_daily",
+            "submitting EMR job: app=%s year=%d catalog=glue.%s (3 tables)",
             application_id,
             year,
             glue_database,
@@ -269,8 +222,6 @@ with DAG(
                         "glue",
                         "--database",
                         glue_database,
-                        "--table",
-                        "historical_daily",
                         "--year",
                         str(year),
                     ],
@@ -315,7 +266,7 @@ with DAG(
                     "s3MonitoringConfiguration": {"logUri": f"s3://{bucket}/spark-logs/"}
                 }
             },
-            name=f"historical-daily-{year}",
+            name=f"historical-{year}",
         )
         job_run_id = response["jobRunId"]
         log.info("submitted EMR job_run_id=%s for year=%d", job_run_id, year)
@@ -346,60 +297,53 @@ with DAG(
             raise AirflowException(f"EMR job {job_run_id} ended in state {state}: {details}")
         return PokeReturnValue(is_done=False)
 
-    @task(task_id="create_iceberg_table")
-    def create_iceberg_table() -> None:
-        """Idempotent CREATE ICEBERG TABLE IF NOT EXISTS in Snowflake.
-
-        Binds Snowflake's table to the Glue catalog entry that Spark just
-        registered. First run creates; subsequent runs are no-ops thanks
-        to IF NOT EXISTS. Safe to retry.
-
-        The table is `external_volume`-bound and `catalog`-bound to the
-        Snowflake objects we provisioned in Terraform. Snowflake reads
-        the manifest pointer from Glue and the data files from the
-        EXTERNAL VOLUME's S3 prefix — no copy.
-        """
+    @task(task_id="create_iceberg_tables")
+    def create_iceberg_tables() -> None:
+        """CREATE ICEBERG TABLE IF NOT EXISTS for each of the 3 historical
+        tables. Idempotent. Each table is bound to its Glue catalog entry
+        via CATALOG_TABLE_NAME — Spark already registered them in Glue."""
         from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 
         external_volume = Variable.get("snowflake_external_volume")
         catalog_integration = Variable.get("snowflake_catalog_integration")
         glue_database = Variable.get("glue_database")
 
-        sql = f"""
-            CREATE ICEBERG TABLE IF NOT EXISTS {SF_HISTORICAL_FQTN}
-            EXTERNAL_VOLUME       = '{external_volume}'
-            CATALOG               = '{catalog_integration}'
-            CATALOG_TABLE_NAME    = 'historical_daily'
-            CATALOG_NAMESPACE     = '{glue_database}'
-            AUTO_REFRESH          = TRUE
-        """
-        log.info("ensuring Iceberg table %s exists", SF_HISTORICAL_FQTN)
-        SnowflakeHook(snowflake_conn_id=SF_DBT_CONN_ID).run(sql)
+        hook = SnowflakeHook(snowflake_conn_id=SF_DBT_CONN_ID)
+        for sf_table, glue_table in HISTORICAL_TABLES:
+            fqtn = _sf_fqtn(sf_table)
+            sql = f"""
+                CREATE ICEBERG TABLE IF NOT EXISTS {fqtn}
+                EXTERNAL_VOLUME       = '{external_volume}'
+                CATALOG               = '{catalog_integration}'
+                CATALOG_TABLE_NAME    = '{glue_table}'
+                CATALOG_NAMESPACE     = '{glue_database}'
+                AUTO_REFRESH          = TRUE
+            """
+            log.info("ensuring Iceberg table %s exists (glue=%s)", fqtn, glue_table)
+            hook.run(sql)
 
-    @task(task_id="refresh_iceberg")
-    def refresh_iceberg() -> None:
-        """ALTER ICEBERG TABLE ... REFRESH — pulls the latest snapshot pointer
-        from Glue immediately. Eliminates the 30-60s polling lag from the
-        catalog integration's auto-refresh; gives this DAG run a deterministic
-        'data is visible' signal."""
+    @task(task_id="refresh_iceberg_tables")
+    def refresh_iceberg_tables() -> None:
+        """ALTER ICEBERG TABLE ... REFRESH for each — pulls the latest Glue
+        snapshot immediately, no 30-60s catalog-poll wait. Idempotent."""
         from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 
-        sql = f"ALTER ICEBERG TABLE {SF_HISTORICAL_FQTN} REFRESH"
-        log.info("refreshing Iceberg snapshot for %s", SF_HISTORICAL_FQTN)
-        SnowflakeHook(snowflake_conn_id=SF_DBT_CONN_ID).run(sql)
+        hook = SnowflakeHook(snowflake_conn_id=SF_DBT_CONN_ID)
+        for sf_table, _ in HISTORICAL_TABLES:
+            fqtn = _sf_fqtn(sf_table)
+            log.info("refreshing Iceberg snapshot for %s", fqtn)
+            hook.run(f"ALTER ICEBERG TABLE {fqtn} REFRESH")
 
     # ---- wiring -----------------------------------------------------------
-    # ensure_year_in_s3 → submit_emr_job → wait_for_emr → create_iceberg_table → refresh_iceberg
-    #
-    # Sequential by data-dependency: EMR can't run until the year's
-    # parquet is in S3; the Iceberg DDL can't run until EMR has
-    # registered the Glue table; the REFRESH can't run until the table
-    # exists in Snowflake.
+    # ensure_year_in_s3 → submit_emr_job → wait_for_emr
+    #     → create_iceberg_tables → refresh_iceberg_tables
+    # Sequential by data-dependency. The two trailing tasks each loop over
+    # all 3 historical tables internally, keeping the topology unchanged.
 
     ingested = ensure_year_in_s3()
     job_id = submit_emr_job()
     waited = wait_for_emr(job_id)
-    created = create_iceberg_table()
-    refreshed = refresh_iceberg()
+    created = create_iceberg_tables()
+    refreshed = refresh_iceberg_tables()
 
     ingested >> job_id >> waited >> created >> refreshed

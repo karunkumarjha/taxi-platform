@@ -66,9 +66,7 @@ vars:
   # Minimum monthly volume before the M-over-M comparison runs. Avoids false
   # positives from partial-month tails (e.g. a single Feb row in the Jan file).
   monthly_rowcount_min: 10000
-  # Phantom-month threshold for incremental detection: a (year, month) only
-  # gets aggregated for the FIRST time once it has at least this many rows
-  # in the source layer. Stops TLC's cross-month tail-bleed (~100 rows that
-  # leak into the wrong file) from creating partial-month aggregates.
-  # Real NYC monthly volume is ~3M rows, so 100k is a wide safety margin.
-  phantom_month_threshold: 100000
+  # target_year / target_month are passed per Airflow run from the DAG;
+  # they're consumed by intermediate + monthly marts (single-month scope)
+  # and yearly marts (target_year only). No project-level default — a
+  # missing var should fail loud in CI rather than silently full-refresh.

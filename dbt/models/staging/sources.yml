@@ -31,9 +31,9 @@ sources:
           - name: trip_distance
             description: "Meter-recorded distance in miles."
           - name: pulocationid
-            description: "TLC zone for pickup. FK to taxi_zones.LocationID."
+            description: "TLC zone for pickup. FK to dim_zones.location_id."
           - name: dolocationid
-            description: "TLC zone for dropoff. FK to taxi_zones.LocationID."
+            description: "TLC zone for dropoff. FK to dim_zones.location_id."
           - name: fare_amount
             description: "Metered fare (excl. tips/tolls/surcharges)."
           - name: tip_amount
@@ -50,3 +50,41 @@ sources:
             description: "Caller name (dbt_pipeline, manual). Lets analysts attribute each row to its load source."
           - name: _loaded_at
             description: "Pipeline load timestamp (defaulted at COPY)."
+
+      - name: source_fingerprints
+        description: >
+          Per-file ETag fingerprints for TLC source parquet files. Populated
+          by the Airflow detect_source_drift task on every run; updated by
+          record_fingerprint after a successful build. Drives drift detection
+          for retroactive TLC corrections (republished files) — see README
+          architecture section.
+        columns:
+          - name: filename
+            description: "TLC parquet filename (e.g. yellow_tripdata_2023-03.parquet)."
+            tests: [not_null, unique]
+          - name: etag
+            description: "ETag from CloudFront HEAD (forwarded from S3 origin)."
+            tests: [not_null]
+          - name: last_modified
+            description: "Last-Modified header from CloudFront HEAD."
+          - name: content_length
+            description: "Content-Length header from CloudFront HEAD."
+          - name: recorded_at
+            description: "Pipeline timestamp when this fingerprint was last recorded."
+
+  - name: historical
+    description: >
+      Iceberg tables written by `spark/process_historical.py` on EMR
+      Serverless and registered in AWS Glue. Snowflake reads zero-copy via
+      CATALOG INTEGRATION. One Spark application produces all three tables
+      from a single source read; each `spark_historical` DAG run replaces
+      one year's partitions atomically.
+    database: "{{ env_var('SNOWFLAKE_DATABASE', 'ANALYTICS') }}"
+    schema: HISTORICAL
+    tables:
+      - name: daily_agg
+        description: "Daily-grain aggregate by (date, hour, zone, payment_type). Serves Q1, Q2."
+      - name: supply_gaps
+        description: "Daily-grain supply-gap metrics by (date, zone). Serves Q3."
+      - name: tip_behaviour
+        description: "Daily-grain tip metrics by (date, zone, distance_bucket, payment_type). Serves Q4."

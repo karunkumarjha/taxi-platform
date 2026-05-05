@@ -138,20 +138,11 @@ def copy_from_stage(
     batch_id: str | None = None,
     loaded_by: str = "manual",
 ) -> list[tuple]:
-    """Run COPY INTO from the external stage; returns the per-file result rows.
+    """COPY INTO from the external stage. Returns per-file result rows.
 
-    If `month` (YYYY-MM) is provided, the COPY scopes to a single file
-    (`yellow_tripdata_YYYY-MM.parquet`) via Snowflake's `FILES = (...)` clause.
-    Otherwise it loads everything currently on the stage.
-
-    FORCE=TRUE ensures each call re-loads the file regardless of Snowflake's
-    COPY history — RAW is append-only (Bronze layer). Audit columns:
-      • _ingest_batch_id — UUID4 per call; identifies the load event.
-      • _loaded_by — caller name (e.g. "dbt_pipeline", "manual") so
-        analysts can attribute each row to its load source.
-
-    `batch_id` defaults to a new UUID4 if not supplied.
-    `loaded_by` defaults to "manual" — the CLI entrypoint.
+    If `month` (YYYY-MM) is given, scopes to one file via FILES=(...).
+    FORCE=TRUE re-loads regardless of COPY history — RAW is append-only,
+    audit columns (_ingest_batch_id, _loaded_by) distinguish each event.
     """
     # Snowflake interprets FILES paths relative to the stage URL
     # (s3://bucket/raw/), so we pass the bare filename.

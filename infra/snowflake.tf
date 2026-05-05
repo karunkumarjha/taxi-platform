@@ -37,7 +37,7 @@ resource "snowflake_schema" "marts_build" {
   comment  = "BUILD analytics layer — dbt writes here. Swapped into MARTS after tests pass."
 }
 
-# HISTORICAL schema holds the Iceberg `HISTORICAL_DAILY_AGG` table, populated
+# HISTORICAL schema holds the Iceberg `DAILY_AGG` table, populated
 # by Spark on EMR Serverless and read by Snowflake via Glue CATALOG INTEGRATION.
 # Lives in its own schema (NOT inside MARTS) so the blue-green
 # `ALTER SCHEMA MARTS_BUILD SWAP WITH MARTS` can't accidentally move it —
@@ -115,7 +115,7 @@ resource "snowflake_external_volume" "historical" {
   # against the read-only snowflake_iceberg IAM role (infra/iam.tf).
   allow_writes = "false"
 
-  comment = "S3 location backing the Iceberg HISTORICAL.HISTORICAL_DAILY_AGG table."
+  comment = "S3 location backing the Iceberg HISTORICAL.DAILY_AGG table."
 }
 
 # Catalog integration is created via raw SQL. The Snowflake Terraform
@@ -137,7 +137,7 @@ resource "snowflake_execute" "glue_catalog_integration" {
         CATALOG_NAMESPACE   = '${aws_glue_catalog_database.taxi_iceberg.name}'
         REFRESH_INTERVAL_SECONDS = 30
         ENABLED             = TRUE
-        COMMENT             = 'AWS Glue catalog integration for Iceberg HISTORICAL_DAILY_AGG'
+        COMMENT             = 'AWS Glue catalog integration for Iceberg DAILY_AGG'
   SQL
 
   revert = "DROP CATALOG INTEGRATION IF EXISTS GLUE_CATALOG"
@@ -145,25 +145,18 @@ resource "snowflake_execute" "glue_catalog_integration" {
   query = "SHOW CATALOG INTEGRATIONS LIKE 'GLUE_CATALOG'"
 }
 
-# The Iceberg table itself is created out-of-band by the spark_historical DAG
-# (CREATE ICEBERG TABLE IF NOT EXISTS), so Terraform doesn't track it. Without
-# this resource, `terraform destroy` would fail on both the external volume
-# and the catalog integration because Snowflake refuses to drop either while
-# the table still references them.
+# The Iceberg table DAILY_AGG is created out-of-band by the
+# spark_historical DAG (CREATE ICEBERG TABLE IF NOT EXISTS), so Terraform
+# doesn't track it. Without an explicit cleanup, `terraform destroy` fails
+# on the EXTERNAL VOLUME and CATALOG INTEGRATION because Snowflake refuses
+# to drop either while a referencing Iceberg table still exists.
 #
-# `execute` is a no-op on apply (DAG owns the create); `revert` drops the
-# table on destroy. `depends_on` forces Terraform to destroy this resource
-# first (destroy order = reverse of create), running the DROP before the
-# volume + catalog integration are torn down.
-resource "snowflake_execute" "historical_iceberg_table_cleanup" {
-  execute = "SELECT 1"
-  revert  = "DROP ICEBERG TABLE IF EXISTS ANALYTICS.HISTORICAL.HISTORICAL_DAILY_AGG"
-
-  depends_on = [
-    snowflake_external_volume.historical,
-    snowflake_execute.glue_catalog_integration,
-  ]
-}
+# Cleanup lives in the Makefile (`make infra-destroy`), which runs
+# `dbt run-operation drop_historical_iceberg` AS THE DBT ROLE (the table's
+# owner) before invoking terraform destroy. We can't do this via
+# snowflake_execute because Terraform's snowflake provider runs as
+# ACCOUNTADMIN, and Snowflake refuses to DROP an object owned by another
+# role even from ACCOUNTADMIN unless ownership is explicitly transferred.
 
 # Surface the catalog integration name as a local for outputs / DAG variables.
 locals {

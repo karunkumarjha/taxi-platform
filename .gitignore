@@ -48,3 +48,9 @@ airflow/logs/
 .idea/
 .vscode/
 *.swp
+
+# Pytest cache
+.pytest_cache/
+
+# Assignment brief — interview material, not redistributed
+assignment.pdf

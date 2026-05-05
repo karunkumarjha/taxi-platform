@@ -1,60 +1,58 @@
 /*
 ================================================================================
-Business question (Q2): How do trip volume and average fare vary across hours
-of the day? When are the peak and trough periods?
+Business question (Q2): How does trip volume and average fare vary across
+hours of the day? When are the peak and trough periods?
 ================================================================================
 
 Approach
 --------
-Aggregate by (pickup_dow, pickup_hour) across 2023, then use window functions
-to tag the single peak hour (highest trip_count) and single trough hour
-(lowest non-zero trip_count) for each day-of-week. QUALIFY keeps only the
-peak + trough rows plus any hour the caller explicitly filters in.
+Read agg_hourly_demand_yearly — the year-grain rollup over the monthly
+hourly_demand mart. It already holds `trip_count` and trip-weighted
+`avg_fare` per (pickup_year, pickup_dow, pickup_hour), so the business
+question is answered by:
+
+  1. SELECT the year of interest                        — pruning
+  2. tag the peak / trough hour per day-of-week         — window functions
+  3. order by (dow, hour) for a readable matrix         — straightforward
+
+The yearly mart smooths month-to-month variation so the "peak" and
+"trough" labels reflect the year as a whole rather than any single month.
 
 SQL features used
 -----------------
-* CTE stack with aggregations (COUNT, AVG, APPROX_PERCENTILE).
-* APPROX_PERCENTILE for median fare — Snowflake-native HLL-like function,
-  much cheaper than PERCENTILE_CONT at scale.
-* Two window functions over the same partition (peak + trough identification).
-* QUALIFY to filter on window results without a subquery.
+* Two window functions over the same partition: MAX/MIN over
+  `pickup_dow` to identify the busiest and quietest hour per DOW, and
+  RANK over the same partition for the full ordering.
 
-Performance on Snowflake (38M rows)
------------------------------------
-* Pruning: WHERE pickup_year = 2023 hits the cluster key.
-* Aggregation cost: output grain is 7*24 = 168 rows; the hard work is the
-  first-pass aggregate over ~38M rows, which parallelises well on XS.
-* Alternative: if this query is hit constantly from Snowsight, redirect to
-  mart `fct_hourly_demand` — identical semantics, pre-aggregated to 2016 rows.
+Performance on Snowflake
+------------------------
+* Reads the yearly mart — 7 × 24 = 168 rows. Trivially cheap.
+* Cluster key is `pickup_year`; the predicate prunes to one year's
+  partition. Result cache catches repeat dashboard hits within the
+  24h cache TTL.
+* If month-level granularity is later wanted, switch the source to
+  `agg_hourly_demand_monthly` and group by (pickup_year, pickup_month, dow,
+  hour) — same shape, one more grouping column.
 ================================================================================
 */
 
-WITH hourly AS (
+WITH tagged AS (
     SELECT
         pickup_dow,
         pickup_hour,
-        COUNT(*)                                  AS trip_count,
-        AVG(fare_amount)                          AS avg_fare,
-        AVG(total_amount)                         AS avg_total,
-        AVG(trip_distance)                        AS avg_distance_mi,
-        AVG(trip_duration_min)                    AS avg_duration_min,
-        APPROX_PERCENTILE(fare_amount, 0.5)       AS p50_fare,
-        APPROX_PERCENTILE(fare_amount, 0.9)       AS p90_fare
-    FROM ANALYTICS.MARTS.FCT_TRIPS
-    WHERE pickup_year = 2023
-    GROUP BY 1, 2
-),
-
-tagged AS (
-    SELECT
-        *,
+        trip_count,
+        avg_fare,
+        avg_total,
+        avg_distance,
+        avg_duration_min,
         CASE
             WHEN trip_count = MAX(trip_count) OVER (PARTITION BY pickup_dow) THEN 'peak'
             WHEN trip_count = MIN(trip_count) OVER (PARTITION BY pickup_dow) THEN 'trough'
             ELSE NULL
-        END AS dow_extreme,
+        END                                                         AS dow_extreme,
         RANK() OVER (PARTITION BY pickup_dow ORDER BY trip_count DESC) AS dow_trip_rank
-    FROM hourly
+    FROM ANALYTICS.MARTS.AGG_HOURLY_DEMAND_YEARLY
+    WHERE pickup_year = 2023
 )
 
 SELECT
@@ -63,10 +61,8 @@ SELECT
     trip_count,
     ROUND(avg_fare, 2)         AS avg_fare_usd,
     ROUND(avg_total, 2)        AS avg_total_usd,
-    ROUND(avg_distance_mi, 2)  AS avg_distance_mi,
+    ROUND(avg_distance, 2)     AS avg_distance_mi,
     ROUND(avg_duration_min, 1) AS avg_duration_min,
-    ROUND(p50_fare, 2)         AS p50_fare_usd,
-    ROUND(p90_fare, 2)         AS p90_fare_usd,
     dow_extreme,
     dow_trip_rank
 FROM tagged

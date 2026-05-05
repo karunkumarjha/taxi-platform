@@ -28,7 +28,6 @@ load_dotenv()
 log = logging.getLogger("ingest_tlc")
 
 TLC_BASE = "https://d37ci6vzurychx.cloudfront.net/trip-data"
-TLC_ZONE_LOOKUP = "https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv"
 DEFAULT_YEAR = 2023
 
 
@@ -139,16 +138,23 @@ def ingest_missing(
     prefix: str = "raw/",
     *,
     s3_client=None,
+    force: bool = False,
 ) -> list[str]:
-    """Upload only months not already present in s3://<bucket>/<prefix>.
+    """Upload months from CloudFront to S3.
 
-    Returns the list of S3 keys that were newly uploaded.
+    By default, skips months whose key is already present in
+    s3://<bucket>/<prefix> (idempotent ingest). Set force=True to re-download
+    and overwrite — used by the drift-detection path when TLC republishes
+    a corrected file and we need the fresh bytes in S3 before re-loading
+    into Snowflake.
+
+    Returns the list of S3 keys that were uploaded.
     """
     s3 = s3_client or boto3.client("s3")
     uploaded: list[str] = []
     for month in months:
         key = s3_key(month, prefix)
-        if object_exists(s3, bucket, key):
+        if not force and object_exists(s3, bucket, key):
             log.info("skip %s — already in S3", key)
             continue
         if not is_published_on_tlc(month.url):
@@ -157,31 +163,16 @@ def ingest_missing(
             # quietly and move on (rather than failing the whole batch).
             log.warning("skip %s — TLC has not published %s yet", key, month.url)
             continue
+        if force and object_exists(s3, bucket, key):
+            log.warning("force-overwriting %s (drift re-ingest)", key)
         size = stream_month_to_s3(s3, bucket, key, month.url)
         log.info("uploaded %s (%.1f MB)", key, size / 1_048_576)
         uploaded.append(key)
     return uploaded
 
 
-def ensure_zone_lookup(local_path: str) -> None:
-    """Fetch taxi_zone_lookup.csv to disk for use as a dbt seed.
-
-    The zone lookup is small + static — committing it as a seed is the idiomatic dbt
-    pattern, so this step runs at most once (when the seed file is missing).
-    """
-    if os.path.exists(local_path):
-        log.info("zone lookup already present at %s", local_path)
-        return
-    os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
-    log.info("fetching %s → %s", TLC_ZONE_LOOKUP, local_path)
-    resp = requests.get(TLC_ZONE_LOOKUP, timeout=30)
-    resp.raise_for_status()
-    with open(local_path, "wb") as fh:
-        fh.write(resp.content)
-
-
 def main(argv: list[str] | None = None) -> int:
-    """CLI entry: parse args, fetch zone lookup, ingest missing months to S3."""
+    """CLI entry: parse args, ingest missing months to S3."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--months",
@@ -198,11 +189,6 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("S3_RAW_PREFIX", "raw/"),
         help="S3 prefix (default: $S3_RAW_PREFIX or 'raw/').",
     )
-    parser.add_argument(
-        "--zone-lookup",
-        default="dbt/seeds/taxi_zones.csv",
-        help="Local path to cache taxi_zone_lookup.csv for dbt seeds.",
-    )
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args(argv)
 
@@ -218,7 +204,6 @@ def main(argv: list[str] | None = None) -> int:
     log.info("ingest start bucket=%s prefix=%s months=%d", args.bucket, args.prefix, len(months))
     started = datetime.utcnow()
 
-    ensure_zone_lookup(args.zone_lookup)
     uploaded = ingest_missing(months, args.bucket, args.prefix)
 
     elapsed = (datetime.utcnow() - started).total_seconds()

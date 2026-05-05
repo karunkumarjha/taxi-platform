@@ -37,7 +37,7 @@ output "snowflake_marts_build_schema" {
 }
 
 output "snowflake_historical_schema" {
-  description = "Schema holding the Iceberg HISTORICAL_DAILY_AGG table (read by ANALYST)"
+  description = "Schema holding the Iceberg DAILY_AGG table (read by ANALYST)"
   value       = snowflake_schema.historical.name
 }
 
