@@ -118,7 +118,7 @@ jobs:
           spark_required = {
               'ensure_year_in_s3',
               'submit_emr_job', 'wait_for_emr',
-              'create_iceberg_table', 'refresh_iceberg',
+              'create_iceberg_tables', 'refresh_iceberg_tables',
           }
           assert not (spark_required - spark_tasks), (
               f'spark_historical missing tasks: {spark_required - spark_tasks}'
