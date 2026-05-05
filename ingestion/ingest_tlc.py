@@ -91,15 +91,22 @@ def object_exists(s3, bucket: str, key: str) -> bool:
 def is_published_on_tlc(url: str) -> bool:
     """HEAD-check TLC's CloudFront for a parquet URL.
 
-    Returns True if the file is published, False if 404. Other HTTP errors
-    (5xx, connection issues) re-raise — those are real failures, not "month
-    not published yet".
+    Returns True if the file is published, False if not-yet-published.
+    Treats 403 and 404 as "not published" — CloudFront fronts an S3 origin,
+    and S3 returns 403 (Forbidden) rather than 404 when the key doesn't
+    exist and the requester lacks s3:ListBucket. The 403 is the
+    information-leak-safe equivalent of "missing object" here, so we
+    can't distinguish it from a real auth failure at HEAD-time; we trust
+    the URL pattern and treat both as "month not published yet".
+
+    Other HTTP errors (5xx, connection issues) re-raise — those are real
+    failures, not "month not published yet".
 
     Lets `make ingest MONTHS=2026` (a year only partially published) succeed
     on what's available and skip the not-yet-published months without exiting.
     """
     resp = requests.head(url, timeout=10, allow_redirects=True)
-    if resp.status_code == 404:
+    if resp.status_code in (403, 404):
         return False
     resp.raise_for_status()
     return True

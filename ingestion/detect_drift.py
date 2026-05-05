@@ -39,10 +39,16 @@ class Fingerprint:
 
 
 def fetch_tlc_fingerprint(filename: str) -> Fingerprint | None:
-    """HEAD CloudFront for `filename`. Return None if not yet published (404)."""
+    """HEAD CloudFront for `filename`. Return None if not yet published.
+
+    Treats 403 and 404 as "not published yet" — S3 returns 403 (not 404)
+    when the key is missing and the requester lacks s3:ListBucket, and
+    CloudFront forwards that. See ingest_tlc.is_published_on_tlc for the
+    full rationale.
+    """
     url = f"{TLC_BASE}/{filename}"
     resp = requests.head(url, timeout=10, allow_redirects=True)
-    if resp.status_code == 404:
+    if resp.status_code in (403, 404):
         log.warning("tlc has not published %s yet", filename)
         return None
     resp.raise_for_status()
